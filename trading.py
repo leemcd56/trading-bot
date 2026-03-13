@@ -24,10 +24,12 @@ from config import (
 
 load_dotenv()
 
+_base_url = os.getenv("ALPACA_BASE_URL")
 trading_client = TradingClient(
     api_key=os.getenv('ALPACA_API_KEY'),
     secret_key=os.getenv('ALPACA_SECRET_KEY'),
-    paper=True   # Change to False only when going live (very carefully!)
+    paper=True,   # Change to False only when going live (very carefully!)
+    url_override=_base_url if _base_url else None,
 )
 
 TRADE_LOG_TABLE = "trade_log"

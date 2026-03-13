@@ -43,6 +43,7 @@ Edit `.env`:
 
 - **Alpaca** (paper): `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`. Use [Alpaca paper trading](https://app.alpaca.markets/paper/dashboard) and keep `ALPACA_BASE_URL=https://paper-api.alpaca.markets` for paper.
 - **Finnhub:** `FINNHUB_API_KEY` from [Finnhub](https://finnhub.io/).
+- **MotherDuck (optional):** Set `MOTHERDUCK_TOKEN` to use [MotherDuck](https://motherduck.com) hosted DuckDB instead of a local `trends.db` file. Data (candles, trade log) then lives in the cloud and survives redeploys or machine loss.
 
 Never commit `.env`; it is gitignored.
 
@@ -64,7 +65,7 @@ Edit **`config.py`** to change:
 |----------|---------|--------------|
 | `SYMBOLS` | `['AAPL', 'TSLA', 'GOOG', 'MSFT']` | Watchlist / symbols to trade |
 | `CHECK_INTERVAL_MINUTES` | `10` | Minutes between each run |
-| `DB_PATH` | `'trends.db'` | DuckDB file for candles and trade log |
+| `DB_PATH` | `'trends.db'` or MotherDuck | Set `MOTHERDUCK_TOKEN` in `.env` to use hosted DuckDB (persistent cloud storage); otherwise uses local `trends.db` |
 | `TRENDS_RETAIN_DAYS` | `7` | Keep this many days of candle data; older rows are pruned each run |
 | `TRADE_LOG_RETAIN_DAYS` | `30` | Keep this many days of trade log; older rows pruned (weekly count needs 7+) |
 | `MAX_DAILY_TRADES` | `3` | Max new orders in rolling 24 hours |
@@ -236,6 +237,61 @@ python -m pytest tests/ -v
 **Entry (all required):** Strong trend (ADX > 25), uptrend (+DI > -DI), price above SAR and near upper Bollinger Band, fresh bullish signal (crossover or SAR flip), MACD > signal, RSI > 55, price > SMA(50), not similar to yesterday, no BB squeeze, and under position/trade limits.
 
 **Exit (any):** Price below SAR or SAR flip to bear, near lower band, dive-bombing (downtrend + RSI < 35 + sharp drop), bearish +DI/-DI crossover, or **stop-loss** (price down ≥ `STOP_LOSS_PCT` from average entry).
+
+---
+
+## Deployment
+
+The bot is a **long-running process**: it loops every 10 minutes and only does work during US market hours. You need a machine that stays on (or a server that runs 24/7).
+
+### Where to run
+
+| Option | Best for |
+|--------|----------|
+| **Your computer** | Testing; run `python main.py` in a terminal (or `nohup python main.py &` to keep it running after you close the shell). |
+| **VPS / cloud VM** | Always-on without leaving your PC on. Examples: [DigitalOcean](https://www.digitalocean.com/), [Linode](https://www.linode.com/), [Hetzner](https://www.hetzner.com/), AWS EC2, etc. |
+| **Docker (any host)** | Same environment everywhere; good for VPS or a home server. |
+
+### Should you containerize?
+
+- **Yes** if you want a single, reproducible way to run the bot (same Python, TA-Lib, deps) on any host. Use the included `Dockerfile`.
+- **No** if you’re fine with a venv on one machine (e.g. your laptop or a single VPS). Just run `python main.py` there.
+
+### How to run
+
+**1. Local (no Docker)**  
+From the project root with venv activated:
+
+```bash
+python main.py
+```
+
+Runs forever; schedule fires every 10 minutes. Logs go to `logs/bot.log` and the console.
+
+**2. Docker**  
+Build and run; mount the project dir so the container uses your `.env`, and `trends.db` and `logs/` persist on the host:
+
+```bash
+docker build -t trading-bot .
+docker run -d --name trading-bot --env-file .env -v "$(pwd):/app" -w /app trading-bot
+```
+
+To view logs: `docker logs -f trading-bot`. To stop: `docker stop trading-bot`.
+
+**3. VPS (systemd)**  
+On a Linux server, run the bot as a service so it restarts on reboot:
+
+- Clone the repo, create a venv, install deps, add `.env`.
+- Create a systemd unit (e.g. `/etc/systemd/system/trading-bot.service`) that runs `python main.py` from the project dir with the venv’s Python.
+- `systemctl enable --now trading-bot`.
+
+**4. Cron (alternative)**  
+Instead of a long-running process, you can run the job once every 10 minutes during market hours:
+
+- Add a one-shot entrypoint, e.g. `python -c "from main import job; job()"`, or a small script that calls `job()` then exits.
+- In crontab, run that every 10 minutes (and optionally only between 9:30 and 16:00 ET on weekdays).
+
+The current `main.py` is built as a daemon (infinite loop); the Dockerfile and “run the bot” instructions assume that model. For cron, you’d add a separate script or flag that runs `job()` once and exits.
 
 ---
 

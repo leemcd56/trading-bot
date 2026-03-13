@@ -1,6 +1,18 @@
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
 SYMBOLS = ['AAPL', 'TSLA', 'GOOG', 'MSFT']  # your watchlist
 CHECK_INTERVAL_MINUTES = 10
-DB_PATH = 'trends.db'
+
+# Database: local file or MotherDuck (hosted DuckDB) for persistent cloud storage
+_motherduck_token = os.getenv("MOTHERDUCK_TOKEN")
+DB_PATH = (
+    f"md:?motherduck_token={_motherduck_token}"
+    if _motherduck_token
+    else "trends.db"
+)
 
 # Data retention (prune older rows to keep DB small)
 TRENDS_RETAIN_DAYS = 7        # keep this many days of 1-min candles per symbol

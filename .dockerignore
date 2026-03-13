@@ -1,0 +1,13 @@
+venv
+.env
+.git
+.cursor
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.coverage
+htmlcov
+*.db
+logs/*.log
+.DS_Store
