@@ -71,6 +71,9 @@ Edit **`config.py`** to change:
 | `MAX_WEEKLY_TRADES` | `8` | Max new orders in rolling 7 days |
 | `MAX_OPEN_POSITIONS` | `4` | Max symbols held at once (no new BUY above this) |
 | `STOP_LOSS_PCT` | `0.05` | Sell if position is down 5% from average entry (e.g. `0.03` = 3%) |
+| `RISK_PCT_PER_TRADE` | `0.01` | Risk this fraction of equity per trade (1%); set to `None` for fixed qty=1 |
+| `MAX_POSITION_PCT_EQUITY` | `0.10` | Cap position value at 10% of equity per symbol |
+| `MIN_SHARES` / `MAX_SHARES` | `1` / `100` | Clamp share count when using position sizing |
 
 ---
 
@@ -117,9 +120,11 @@ Edit **`config.py`** to change:
 
 1. **Risk limits** — If daily or weekly trade cap is reached, or open positions are at max, no new BUY; log and return.
 2. **Stop-loss** — If the symbol has an open position and `current_price <= entry * (1 - STOP_LOSS_PCT)`, submit a market SELL for the full position, log, and return.
-3. **BUY** — Only if all of: `strong_trend`, `trending_up_a_lot`, `near_upper_band`, `sar_below_price`, (bullish crossover or SAR flip to bull), not `similar_to_yesterday`, not `bb_squeeze`, not `avoid_long`, and under `MAX_OPEN_POSITIONS`. Submits market BUY, qty=1.
+3. **BUY** — Only if all of: `strong_trend`, `trending_up_a_lot`, `near_upper_band`, `sar_below_price`, (bullish crossover or SAR flip to bull), not `similar_to_yesterday`, not `bb_squeeze`, not `avoid_long`, and under `MAX_OPEN_POSITIONS`. Share quantity is computed by **position sizing** (see below) or fixed 1 if disabled. Submits market BUY.
 4. **SELL** — If any of: `near_lower_band`, `sar_above_price`, `sar_flipped_to_bear`, `dive_bombing`, `bearish_crossover`, and we have a position, submit market SELL for full qty.
 5. Otherwise log “No signal” with the reasons (e.g. which condition failed).
+
+**Position sizing:** If `config.RISK_PCT_PER_TRADE` is set (e.g. `0.01` = 1%), the bot sizes each BUY so that the dollar risk per trade equals that fraction of account equity. Stop distance per share is the larger of ATR(14) and `current_price * STOP_LOSS_PCT`. Quantity is rounded down and clamped to `MIN_SHARES`, `MAX_SHARES`, and `MAX_POSITION_PCT_EQUITY` of equity. Set `RISK_PCT_PER_TRADE = None` to use a fixed quantity of 1 share.
 
 **Stop-loss:** Uses Alpaca’s `avg_entry_price` and `analysis['current_price']`. When price is down by at least `STOP_LOSS_PCT` from entry, the position is closed with a market sell. Checked every run before other signals.
 
@@ -132,11 +137,62 @@ Edit **`config.py`** to change:
 
 ---
 
+## Backtesting
+
+Before risking capital, you can replay historical data through the current strategy.
+
+1. **Backfill historical candles** (uses Finnhub; free tier may limit 1-min history):
+
+   ```bash
+   python backfill.py --start 2025-01-01 --end 2025-03-01 --symbols AAPL,MSFT
+   ```
+
+   Data is stored in the `trends_backtest` table by default (so live `trends` is unchanged). Use `--table NAME` to override.
+
+2. **Run the backtest**:
+
+   ```bash
+   python backtest.py --start 2025-01-01 --end 2025-03-01 --symbols AAPL,MSFT --capital 100000
+   ```
+
+   Output: total return %, max drawdown %, number of trades, win rate, final equity. Optional `--equity-curve path.csv` writes the equity curve for plotting.
+
+The backtest reuses `analyze_trends()` and the same entry/exit rules as live trading (including daily/weekly caps and stop-loss).
+
+---
+
+## Monitoring report
+
+A simple CLI report shows account equity, cash, open positions with unrealized P&L, and recent trades from the trade log:
+
+```bash
+python report.py
+```
+
+Run on demand or schedule it (e.g. after each bot run or via cron). No separate server required.
+
+---
+
+## Alerts
+
+Optional notifications when a trade is placed or when the bot hits an error:
+
+- **Discord:** Set `DISCORD_WEBHOOK_URL` in `.env` (create a webhook in your server under Server Settings → Integrations → Webhooks). The bot will POST a short message on each BUY/SELL (including stop-loss) and on any per-symbol or prune error.
+- **Email (errors only):** Set `ALERT_EMAIL_TO`, `ALERT_EMAIL_FROM`, and `ALERT_EMAIL_SMTP_URL` (e.g. `smtps://user:pass@smtp.example.com:465`) to receive error alerts by email.
+
+Alerts are fire-and-forget; a failing webhook or SMTP does not stop the bot.
+
+---
+
 ## Project structure
 
 ```
 trading-bot/
 ├── main.py           # Scheduler and main loop
+├── backfill.py       # Historical candle backfill for backtesting
+├── backtest.py       # Strategy backtest on historical data
+├── report.py         # Monitoring report (account, positions, P&L, recent trades)
+├── alerts.py         # Discord / email alerts on trades and errors
 ├── config.py         # Symbols, intervals, risk and stop-loss settings
 ├── data_fetch.py     # Finnhub → DuckDB (fetch_and_store)
 ├── analysis.py       # Indicators and signals (analyze_trends)

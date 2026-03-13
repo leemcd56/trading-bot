@@ -7,6 +7,7 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from dotenv import load_dotenv
 from utils import logger
+from alerts import send_alert
 from config import (
     MAX_DAILY_TRADES,
     MAX_WEEKLY_TRADES,
@@ -14,6 +15,10 @@ from config import (
     STOP_LOSS_PCT,
     TRADE_LOG_RETAIN_DAYS,
     DB_PATH,
+    RISK_PCT_PER_TRADE,
+    MAX_POSITION_PCT_EQUITY,
+    MIN_SHARES,
+    MAX_SHARES,
 )
 
 load_dotenv()
@@ -112,6 +117,47 @@ def _open_positions_count() -> int:
         return 0
 
 
+def _get_account_equity() -> float:
+    """Return current account equity (portfolio value). Returns 0 on error."""
+    try:
+        account = trading_client.get_account()
+        # Alpaca returns equity as string
+        return float(account.equity or 0)
+    except Exception as e:
+        logger.warning(f"Failed to get account equity: {e}")
+        return 0.0
+
+
+def _compute_buy_qty(analysis: dict, equity: float) -> int:
+    """
+    Compute number of shares to buy using risk-based position sizing.
+    Risk per trade = RISK_PCT_PER_TRADE * equity.
+    Stop distance per share = max(ATR_14, current_price * STOP_LOSS_PCT).
+    qty = risk_amount / stop_distance_per_share, rounded down, clamped to MIN/MAX_SHARES and max position value.
+    If RISK_PCT_PER_TRADE is None or equity/analysis invalid, returns 1.
+    """
+    if RISK_PCT_PER_TRADE is None or RISK_PCT_PER_TRADE <= 0:
+        return 1
+    price = analysis.get("current_price") or 0
+    if price <= 0 or equity <= 0:
+        return MIN_SHARES
+    atr = analysis.get("atr_14")
+    stop_distance = price * STOP_LOSS_PCT
+    if atr is not None and atr > 0:
+        stop_distance = max(stop_distance, atr)
+    if stop_distance <= 0:
+        return MIN_SHARES
+    risk_amount = RISK_PCT_PER_TRADE * equity
+    # position_value * (stop_distance / price) = risk_amount  =>  position_value = risk_amount * price / stop_distance
+    position_value = risk_amount * price / stop_distance
+    qty = int(position_value / price)
+    max_value = MAX_POSITION_PCT_EQUITY * equity if MAX_POSITION_PCT_EQUITY else position_value
+    max_qty_by_value = int(max_value / price) if price > 0 else 0
+    qty = min(qty, max_qty_by_value, MAX_SHARES)
+    qty = max(qty, MIN_SHARES)
+    return qty
+
+
 def _skip_reasons_buy(analysis: dict) -> list[str]:
     """Return list of reasons we are not buying (for logging)."""
     reasons = []
@@ -169,6 +215,7 @@ def execute_trade(symbol: str, analysis: dict | None):
                 trading_client.submit_order(order)
                 _record_trade(symbol, "SELL")
                 logger.warning(f"Stop-loss SELL for {symbol}: price {current:.2f} <= entry {entry:.2f} * (1 - {STOP_LOSS_PCT:.0%})")
+                send_alert(f"Stop-loss SELL {symbol} qty={qty:.0f} @ {current:.2f} (entry {entry:.2f})", "trade")
                 return
     except Exception as e:
         if "position does not exist" not in str(e).lower():
@@ -186,15 +233,18 @@ def execute_trade(symbol: str, analysis: dict | None):
         if _open_positions_count() >= MAX_OPEN_POSITIONS:
             logger.warning(f"{symbol}: Skipping BUY - max open positions ({MAX_OPEN_POSITIONS})")
             return
+        equity = _get_account_equity()
+        qty = _compute_buy_qty(analysis, equity) if equity > 0 else MIN_SHARES
         order = MarketOrderRequest(
             symbol=symbol,
-            qty=1,
+            qty=qty,
             side=OrderSide.BUY,
             time_in_force=TimeInForce.DAY
         )
         trading_client.submit_order(order)
         _record_trade(symbol, "BUY")
-        logger.info(f"BUY submitted for {symbol}")
+        logger.info(f"BUY submitted for {symbol} qty={qty}")
+        send_alert(f"BUY {symbol} qty={qty}", "trade")
 
     elif (
         analysis.get('near_lower_band') or
@@ -216,6 +266,7 @@ def execute_trade(symbol: str, analysis: dict | None):
                 trading_client.submit_order(order)
                 _record_trade(symbol, "SELL")
                 logger.info(f"SELL submitted for {symbol}")
+                send_alert(f"SELL {symbol} qty={qty:.0f}", "trade")
         except Exception as e:
             if "position does not exist" not in str(e).lower():
                 logger.error(f"Position check failed for {symbol}: {e}")

@@ -4,6 +4,7 @@ from data_fetch import fetch_and_store, prune_old_trends
 from analysis import analyze_trends
 from trading import execute_trade, prune_old_trade_log
 from utils import logger, is_market_open
+from alerts import send_alert
 from config import SYMBOLS, CHECK_INTERVAL_MINUTES
 
 def job():
@@ -17,11 +18,13 @@ def job():
             execute_trade(symbol, analysis)
         except Exception as e:
             logger.error(f"Error processing {symbol}: {e}")
+            send_alert(f"Error processing {symbol}: {e}", "error")
     try:
         prune_old_trends()
         prune_old_trade_log()
     except Exception as e:
         logger.warning(f"Prune failed: {e}")
+        send_alert(f"Prune failed: {e}", "error")
 
 schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(job)
 

@@ -13,3 +13,12 @@ MAX_OPEN_POSITIONS = 4  # max symbols held at once (across SYMBOLS)
 
 # Stop-loss: sell if position is down this much from average entry (e.g. 0.05 = 5%)
 STOP_LOSS_PCT = 0.05
+
+# Position sizing: risk this fraction of equity per trade (e.g. 0.01 = 1%)
+# Set to None to use fixed qty=1 instead of risk-based sizing
+RISK_PCT_PER_TRADE = 0.01
+# Cap position value at this fraction of equity per symbol (e.g. 0.10 = 10%)
+MAX_POSITION_PCT_EQUITY = 0.10
+# Min/max shares per order (when using position sizing)
+MIN_SHARES = 1
+MAX_SHARES = 100

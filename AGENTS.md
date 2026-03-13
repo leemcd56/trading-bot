@@ -23,10 +23,12 @@
 ## Project Folder Structure (as of latest agreement)
 trading-bot/
 ├── main.py                 # Scheduler + main loop
-├── config.py               # SYMBOLS list, constants, intervals
+├── config.py               # SYMBOLS list, constants, intervals, RISK_PCT_PER_TRADE
 ├── data_fetch.py           # fetch_and_store(symbol) → Finnhub → DuckDB
-├── analysis.py             # analyze_trends(symbol) ← ALL indicators live here
-├── trading.py              # execute_trade(symbol, analysis) ← Alpaca orders
+├── backfill.py             # Historical backfill into trends_backtest for backtesting
+├── backtest.py             # Backtest engine (reuses analyze_trends + trading rules)
+├── analysis.py             # analyze_trends(symbol) ← ALL indicators, returns atr_14 for sizing
+├── trading.py              # execute_trade(symbol, analysis) ← Alpaca, position sizing
 ├── utils.py                # is_market_open(), logger, helpers
 ├── .env                    # API keys (gitignore!)
 ├── requirements.txt
@@ -102,6 +104,13 @@ trading-bot/
 - Error recovery & rate-limit handling
 - Docker + VPS deployment instructions
 - Logging rotation & alerts on exceptions
+
+## Nice-to-haves (next steps toward a more robust bot)
+
+- **Backtesting** — Implemented: `backfill.py` + `backtest.py`; replay historical data with current rules; measure P&L, drawdown, win rate. Run after backfilling into `trends_backtest`.
+- **Position sizing** — Implemented: `config.RISK_PCT_PER_TRADE` (e.g. 1% of equity); ATR/stop-based qty in `trading._compute_buy_qty`; set to `None` for fixed qty=1.
+- **Simple monitoring** — Implemented: `report.py` prints account equity, positions, unrealized P&L, daily/weekly trade counts, and recent trade log. Run on demand or on a schedule.
+- **Alerts** — Implemented: `alerts.py` sends Discord webhook messages on each trade (BUY/SELL/stop-loss) and on errors; optional email for errors only. Set `DISCORD_WEBHOOK_URL` (and optionally `ALERT_EMAIL_*`) in `.env`.
 
 ## Quick Commands Reminder
 
