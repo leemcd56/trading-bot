@@ -1,10 +1,14 @@
 # analysis.py
+import time
 import duckdb
 import pandas as pd
 import talib
 import numpy as np
 from config import DB_PATH
 from utils import logger
+
+# Don't trade on data older than this (minutes)
+STALE_BAR_MINUTES = 45
 
 
 def analyze_trends(symbol: str, connection=None) -> dict | None:
@@ -26,6 +30,16 @@ def analyze_trends(symbol: str, connection=None) -> dict | None:
     if len(df) < 50:
         logger.warning(f"Not enough data for {symbol} (have {len(df)} bars)")
         return None
+
+    # Data quality: skip if latest bar is too old (production only)
+    if connection is None:
+        try:
+            last_ts = int(df["timestamp"].iloc[-1])
+            if time.time() - last_ts > STALE_BAR_MINUTES * 60:
+                logger.warning(f"Stale data for {symbol} (latest bar {STALE_BAR_MINUTES}+ min old)")
+                return None
+        except (ValueError, TypeError):
+            pass
 
     # Ensure numeric columns
     for col in ['high', 'low', 'close']:

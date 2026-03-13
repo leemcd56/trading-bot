@@ -10,8 +10,9 @@ from config import DB_PATH
 from utils import logger
 
 FINNHUB_BASE = "https://finnhub.io/api/v1/stock/candle"
-# Request last ~5 trading days of 1-min bars (390 min/day * 5 ≈ 2000)
 LOOKBACK_MINUTES = 2000
+MAX_RETRIES = 3
+RETRY_BACKOFF_SEC = 2  # exponential: 2, 4, 8
 
 
 def fetch_and_store(symbol: str) -> None:
@@ -20,10 +21,8 @@ def fetch_and_store(symbol: str) -> None:
         logger.warning("FINNHUB_API_KEY not set - skipping fetch")
         return
 
-    tz = pytz.timezone("US/Eastern")
     now = time.time()
     from_ts = int(now - LOOKBACK_MINUTES * 60)
-
     params = {
         "symbol": symbol,
         "resolution": "1",
@@ -31,15 +30,36 @@ def fetch_and_store(symbol: str) -> None:
         "to": int(now),
         "token": api_key,
     }
-    try:
-        r = requests.get(FINNHUB_BASE, params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-    except requests.RequestException as e:
-        logger.error(f"Finnhub request failed for {symbol}: {e}")
-        return
-    except Exception as e:
-        logger.error(f"Unexpected error fetching {symbol}: {e}")
+
+    data = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = requests.get(FINNHUB_BASE, params=params, timeout=30)
+            if r.status_code == 429:
+                wait = RETRY_BACKOFF_SEC ** (attempt + 1)
+                logger.warning(f"Finnhub rate limit (429) for {symbol}, retry in {wait}s")
+                time.sleep(wait)
+                continue
+            if r.status_code >= 500:
+                wait = RETRY_BACKOFF_SEC ** (attempt + 1)
+                logger.warning(f"Finnhub server error {r.status_code} for {symbol}, retry in {wait}s")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            break
+        except requests.RequestException as e:
+            if attempt == MAX_RETRIES - 1:
+                logger.error(f"Finnhub request failed for {symbol} after {MAX_RETRIES} attempts: {e}")
+                return
+            wait = RETRY_BACKOFF_SEC ** (attempt + 1)
+            logger.warning(f"Finnhub request failed for {symbol}: {e}, retry in {wait}s")
+            time.sleep(wait)
+        except Exception as e:
+            logger.error(f"Unexpected error fetching {symbol}: {e}")
+            return
+
+    if data is None:
         return
 
     if not data.get("t") or not data.get("c"):
