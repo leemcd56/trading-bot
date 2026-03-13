@@ -194,3 +194,99 @@ def test_stop_loss_does_not_sell_when_above_threshold():
         trading.execute_trade("TEST", analysis)
         # Stop-loss not triggered; no other sell signal -> submit_order not called
         mock_client.submit_order.assert_not_called()
+
+
+def _buy_conditions_for_notional():
+    """Analysis dict that satisfies all BUY conditions (for notional/whole-share tests)."""
+    return {
+        "strong_trend": True,
+        "uptrend": True,
+        "trending_up_a_lot": True,
+        "near_upper_band": True,
+        "sar_below_price": True,
+        "bullish_crossover": True,
+        "sar_flipped_to_bull": False,
+        "similar_to_yesterday": False,
+        "bb_squeeze": False,
+        "avoid_long": False,
+    }
+
+
+def test_notional_mode_buys_whole_share_when_price_le_notional():
+    """When NOTIONAL_PER_TRADE is set and price <= notional and we have buying power, buy 1 whole share."""
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "NOTIONAL_PER_TRADE", 75), \
+         patch.object(trading, "_get_buying_power", return_value=100.0):
+        mock_client.get_position.side_effect = Exception("position does not exist")
+        mock_client.get_all_positions.return_value = []
+        analysis = _buy_conditions_for_notional()
+        analysis["current_price"] = 50.0  # 50 <= 75, can afford 1 share
+        trading.execute_trade("TEST", analysis)
+        mock_client.submit_order.assert_called_once()
+        order = mock_client.submit_order.call_args[0][0]
+        assert order.side == OrderSide.BUY
+        assert getattr(order, "qty", None) == 1
+        # Notional should not be set when we use qty
+        assert getattr(order, "notional", None) is None
+
+
+def test_notional_mode_buys_whole_share_when_price_equals_notional():
+    """When price equals NOTIONAL_PER_TRADE and we have buying power, buy 1 whole share."""
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "NOTIONAL_PER_TRADE", 75), \
+         patch.object(trading, "_get_buying_power", return_value=100.0):
+        mock_client.get_position.side_effect = Exception("position does not exist")
+        mock_client.get_all_positions.return_value = []
+        analysis = _buy_conditions_for_notional()
+        analysis["current_price"] = 75.0  # 75 <= 75
+        trading.execute_trade("TEST", analysis)
+        mock_client.submit_order.assert_called_once()
+        order = mock_client.submit_order.call_args[0][0]
+        assert order.side == OrderSide.BUY
+        assert getattr(order, "qty", None) == 1
+
+
+def test_notional_mode_buys_notional_when_price_above_notional():
+    """When NOTIONAL_PER_TRADE is set and price > notional, buy with notional (fractional)."""
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "NOTIONAL_PER_TRADE", 75), \
+         patch.object(trading, "_get_buying_power", return_value=100.0):
+        mock_client.get_position.side_effect = Exception("position does not exist")
+        mock_client.get_all_positions.return_value = []
+        analysis = _buy_conditions_for_notional()
+        analysis["current_price"] = 200.0  # 200 > 75 -> use notional
+        trading.execute_trade("TEST", analysis)
+        mock_client.submit_order.assert_called_once()
+        order = mock_client.submit_order.call_args[0][0]
+        assert order.side == OrderSide.BUY
+        assert getattr(order, "notional", None) == 75.0
+
+
+def test_notional_mode_skips_when_whole_share_unaffordable_uses_notional():
+    """When price <= notional but buying_power < price, use notional (capped by buying power) instead of 1 share."""
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "NOTIONAL_PER_TRADE", 75), \
+         patch.object(trading, "_get_buying_power", return_value=30.0):  # Can't afford 1 share at 50
+        mock_client.get_position.side_effect = Exception("position does not exist")
+        mock_client.get_all_positions.return_value = []
+        analysis = _buy_conditions_for_notional()
+        analysis["current_price"] = 50.0  # 50 <= 75 but buying_power=30 < 50
+        trading.execute_trade("TEST", analysis)
+        mock_client.submit_order.assert_called_once()
+        order = mock_client.submit_order.call_args[0][0]
+        assert order.side == OrderSide.BUY
+        # Should use notional = min(75, 30) = 30
+        assert getattr(order, "notional", None) == 30.0
+
+
+def test_notional_mode_skips_when_buying_power_below_minimum():
+    """When NOTIONAL_PER_TRADE is set but buying power < $1, skip BUY (Alpaca minimum)."""
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "NOTIONAL_PER_TRADE", 75), \
+         patch.object(trading, "_get_buying_power", return_value=0.5):
+        mock_client.get_position.side_effect = Exception("position does not exist")
+        mock_client.get_all_positions.return_value = []
+        analysis = _buy_conditions_for_notional()
+        analysis["current_price"] = 200.0
+        trading.execute_trade("TEST", analysis)
+        mock_client.submit_order.assert_not_called()

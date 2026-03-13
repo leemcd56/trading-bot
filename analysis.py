@@ -201,6 +201,10 @@ def analyze_trends(symbol: str, connection=None) -> dict | None:
 
     avoid_long = dead_cat_bounce or extended_decline or volatility_spike
 
+    # ATR for position sizing (stop distance)
+    atr_14 = latest.get("ATR_14") if "ATR_14" in df.columns else None
+    atr_14_float = float(atr_14) if _ok(atr_14) else None
+
     return {
         "strong_trend": strong_trend,
         "uptrend": uptrend,
@@ -221,4 +225,5 @@ def analyze_trends(symbol: str, connection=None) -> dict | None:
         "volatility_spike": volatility_spike,
         "avoid_long": avoid_long,
         "current_price": close,
+        "atr_14": atr_14_float,
     }
