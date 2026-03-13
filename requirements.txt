@@ -1,0 +1,10 @@
+python-dotenv
+duckdb
+pandas
+numpy
+TA-Lib
+alpaca-py
+requests
+schedule
+pytz
+pytest
