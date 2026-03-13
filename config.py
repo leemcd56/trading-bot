@@ -15,10 +15,15 @@ MAX_OPEN_POSITIONS = 4  # max symbols held at once (across SYMBOLS)
 STOP_LOSS_PCT = 0.05
 
 # Position sizing: risk this fraction of equity per trade (e.g. 0.01 = 1%)
-# Set to None to use fixed qty=1 instead of risk-based sizing
+# Set to None to use fixed qty=1 instead of risk-based sizing (ignored when NOTIONAL_PER_TRADE is set)
 RISK_PCT_PER_TRADE = 0.01
 # Cap position value at this fraction of equity per symbol (e.g. 0.10 = 10%)
 MAX_POSITION_PCT_EQUITY = 0.10
-# Min/max shares per order (when using position sizing)
+# Min/max shares per order (when using qty-based sizing, not notional)
 MIN_SHARES = 1
 MAX_SHARES = 100
+
+# Fractional / small-account mode: when set, each BUY is this many dollars (notional) instead of shares.
+# Example: 75 = buy $75 of the symbol per trade (fractional shares). Alpaca minimum is $1.
+# Set to None to use qty-based sizing above.
+NOTIONAL_PER_TRADE = 75

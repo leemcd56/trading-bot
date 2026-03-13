@@ -73,7 +73,8 @@ Edit **`config.py`** to change:
 | `STOP_LOSS_PCT` | `0.05` | Sell if position is down 5% from average entry (e.g. `0.03` = 3%) |
 | `RISK_PCT_PER_TRADE` | `0.01` | Risk this fraction of equity per trade (1%); set to `None` for fixed qty=1 |
 | `MAX_POSITION_PCT_EQUITY` | `0.10` | Cap position value at 10% of equity per symbol |
-| `MIN_SHARES` / `MAX_SHARES` | `1` / `100` | Clamp share count when using position sizing |
+| `MIN_SHARES` / `MAX_SHARES` | `1` / `100` | Clamp share count when using qty-based sizing (not notional) |
+| `NOTIONAL_PER_TRADE` | `75` | When set, each BUY is this many **dollars** (fractional shares); Alpaca min $1. Set to `None` for qty-based sizing. Good for small accounts (e.g. $50–$75 per trade). |
 
 ---
 
@@ -120,11 +121,13 @@ Edit **`config.py`** to change:
 
 1. **Risk limits** — If daily or weekly trade cap is reached, or open positions are at max, no new BUY; log and return.
 2. **Stop-loss** — If the symbol has an open position and `current_price <= entry * (1 - STOP_LOSS_PCT)`, submit a market SELL for the full position, log, and return.
-3. **BUY** — Only if all of: `strong_trend`, `trending_up_a_lot`, `near_upper_band`, `sar_below_price`, (bullish crossover or SAR flip to bull), not `similar_to_yesterday`, not `bb_squeeze`, not `avoid_long`, and under `MAX_OPEN_POSITIONS`. Share quantity is computed by **position sizing** (see below) or fixed 1 if disabled. Submits market BUY.
+3. **BUY** — Only if all of: `strong_trend`, `trending_up_a_lot`, `near_upper_band`, `sar_below_price`, (bullish crossover or SAR flip to bull), not `similar_to_yesterday`, not `bb_squeeze`, not `avoid_long`, and under `MAX_OPEN_POSITIONS`. If **`NOTIONAL_PER_TRADE`** is set (e.g. `75`), submits a **fractional** market BUY for that many dollars (good for small accounts). Otherwise share quantity is from **position sizing** or fixed 1. Submits market BUY.
 4. **SELL** — If any of: `near_lower_band`, `sar_above_price`, `sar_flipped_to_bear`, `dive_bombing`, `bearish_crossover`, and we have a position, submit market SELL for full qty.
 5. Otherwise log “No signal” with the reasons (e.g. which condition failed).
 
-**Position sizing:** If `config.RISK_PCT_PER_TRADE` is set (e.g. `0.01` = 1%), the bot sizes each BUY so that the dollar risk per trade equals that fraction of account equity. Stop distance per share is the larger of ATR(14) and `current_price * STOP_LOSS_PCT`. Quantity is rounded down and clamped to `MIN_SHARES`, `MAX_SHARES`, and `MAX_POSITION_PCT_EQUITY` of equity. Set `RISK_PCT_PER_TRADE = None` to use a fixed quantity of 1 share.
+**Fractional / notional mode:** If `config.NOTIONAL_PER_TRADE` is set (e.g. `75`), each BUY is normally a **dollar amount** (e.g. $75) via Alpaca’s notional order—you get fractional shares. If the stock’s current price is **less than or equal** to that amount (e.g. $45 ≤ $75) and you have the cash, the bot buys **one whole share** instead of the dollar amount. Ideal for small accounts and mixed watchlists (cheap names get whole shares; expensive ones get fractional). The bot caps notional at your buying power and skips if below Alpaca’s $1 minimum. Set to `None` to use share-based sizing.
+
+**Position sizing (qty mode):** When `NOTIONAL_PER_TRADE` is `None`, if `config.RISK_PCT_PER_TRADE` is set (e.g. `0.01` = 1%), the bot sizes each BUY so that the dollar risk per trade equals that fraction of account equity. Stop distance per share is the larger of ATR(14) and `current_price * STOP_LOSS_PCT`. Quantity is rounded down and clamped to `MIN_SHARES`, `MAX_SHARES`, and `MAX_POSITION_PCT_EQUITY` of equity. Set `RISK_PCT_PER_TRADE = None` to use a fixed quantity of 1 share.
 
 **Stop-loss:** Uses Alpaca’s `avg_entry_price` and `analysis['current_price']`. When price is down by at least `STOP_LOSS_PCT` from entry, the position is closed with a market sell. Checked every run before other signals.
 

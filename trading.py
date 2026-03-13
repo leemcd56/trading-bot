@@ -19,6 +19,7 @@ from config import (
     MAX_POSITION_PCT_EQUITY,
     MIN_SHARES,
     MAX_SHARES,
+    NOTIONAL_PER_TRADE,
 )
 
 load_dotenv()
@@ -128,6 +129,16 @@ def _get_account_equity() -> float:
         return 0.0
 
 
+def _get_buying_power() -> float:
+    """Return current buying power. Returns 0 on error."""
+    try:
+        account = trading_client.get_account()
+        return float(account.buying_power or 0)
+    except Exception as e:
+        logger.warning(f"Failed to get buying power: {e}")
+        return 0.0
+
+
 def _compute_buy_qty(analysis: dict, equity: float) -> int:
     """
     Compute number of shares to buy using risk-based position sizing.
@@ -215,7 +226,7 @@ def execute_trade(symbol: str, analysis: dict | None):
                 trading_client.submit_order(order)
                 _record_trade(symbol, "SELL")
                 logger.warning(f"Stop-loss SELL for {symbol}: price {current:.2f} <= entry {entry:.2f} * (1 - {STOP_LOSS_PCT:.0%})")
-                send_alert(f"Stop-loss SELL {symbol} qty={qty:.0f} @ {current:.2f} (entry {entry:.2f})", "trade")
+                send_alert(f"Stop-loss SELL {symbol} qty={qty:.4g} @ {current:.2f} (entry {entry:.2f})", "trade")
                 return
     except Exception as e:
         if "position does not exist" not in str(e).lower():
@@ -233,18 +244,51 @@ def execute_trade(symbol: str, analysis: dict | None):
         if _open_positions_count() >= MAX_OPEN_POSITIONS:
             logger.warning(f"{symbol}: Skipping BUY - max open positions ({MAX_OPEN_POSITIONS})")
             return
-        equity = _get_account_equity()
-        qty = _compute_buy_qty(analysis, equity) if equity > 0 else MIN_SHARES
-        order = MarketOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY
-        )
-        trading_client.submit_order(order)
-        _record_trade(symbol, "BUY")
-        logger.info(f"BUY submitted for {symbol} qty={qty}")
-        send_alert(f"BUY {symbol} qty={qty}", "trade")
+        if NOTIONAL_PER_TRADE is not None and NOTIONAL_PER_TRADE >= 1:
+            # Fractional mode: buy a fixed dollar amount, or 1 whole share if price <= notional
+            buying_power = _get_buying_power()
+            price = analysis.get("current_price") or 0
+            if price > 0 and price <= NOTIONAL_PER_TRADE and buying_power >= price:
+                # Buy one whole share when it costs less than or equal to our notional target
+                order = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=1,
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.DAY
+                )
+                trading_client.submit_order(order)
+                _record_trade(symbol, "BUY")
+                logger.info(f"BUY submitted for {symbol} qty=1 (whole share, price ${price:.2f} <= ${NOTIONAL_PER_TRADE})")
+                send_alert(f"BUY {symbol} 1 share @ ~${price:.2f}", "trade")
+            else:
+                notional = min(float(NOTIONAL_PER_TRADE), buying_power) if buying_power > 0 else 0.0
+                if notional < 1:
+                    logger.warning(f"{symbol}: Skipping BUY - notional ${notional:.2f} below Alpaca minimum $1")
+                    return
+                notional = round(notional, 2)
+                order = MarketOrderRequest(
+                    symbol=symbol,
+                    notional=notional,
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.DAY
+                )
+                trading_client.submit_order(order)
+                _record_trade(symbol, "BUY")
+                logger.info(f"BUY submitted for {symbol} notional=${notional:.2f}")
+                send_alert(f"BUY {symbol} ${notional:.2f}", "trade")
+        else:
+            equity = _get_account_equity()
+            qty = _compute_buy_qty(analysis, equity) if equity > 0 else MIN_SHARES
+            order = MarketOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY
+            )
+            trading_client.submit_order(order)
+            _record_trade(symbol, "BUY")
+            logger.info(f"BUY submitted for {symbol} qty={qty}")
+            send_alert(f"BUY {symbol} qty={qty}", "trade")
 
     elif (
         analysis.get('near_lower_band') or
@@ -266,10 +310,11 @@ def execute_trade(symbol: str, analysis: dict | None):
                 trading_client.submit_order(order)
                 _record_trade(symbol, "SELL")
                 logger.info(f"SELL submitted for {symbol}")
-                send_alert(f"SELL {symbol} qty={qty:.0f}", "trade")
+                send_alert(f"SELL {symbol} qty={qty:.4g}", "trade")
         except Exception as e:
             if "position does not exist" not in str(e).lower():
                 logger.error(f"Position check failed for {symbol}: {e}")
     else:
         reasons = _skip_reasons_buy(analysis)
         logger.info(f"{symbol}: No signal - {', '.join(reasons)}")
+        send_alert(f"{symbol}: No signal — {', '.join(reasons)}", "hodl")
