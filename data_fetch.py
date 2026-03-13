@@ -6,7 +6,7 @@ import time
 import requests
 import duckdb
 import pandas as pd
-from config import DB_PATH
+from config import DB_PATH, TRENDS_RETAIN_DAYS
 from utils import logger
 
 FINNHUB_BASE = "https://finnhub.io/api/v1/stock/candle"
@@ -107,3 +107,18 @@ def fetch_and_store(symbol: str) -> None:
     con.unregister("_new_bars")
     logger.info(f"Fetched and stored {len(df)} bars for {symbol}")
     con.close()
+
+
+def prune_old_trends() -> None:
+    """Delete candle rows older than TRENDS_RETAIN_DAYS to limit DB size."""
+    if TRENDS_RETAIN_DAYS <= 0:
+        return
+    con = duckdb.connect(DB_PATH)
+    try:
+        cutoff = int(time.time()) - TRENDS_RETAIN_DAYS * 86400
+        con.execute("DELETE FROM trends WHERE timestamp < ?", [cutoff])
+        logger.debug(f"Pruned trends older than {TRENDS_RETAIN_DAYS} days")
+    except Exception as e:
+        logger.warning(f"Prune trends failed: {e}")
+    finally:
+        con.close()

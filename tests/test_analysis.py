@@ -69,7 +69,9 @@ def test_analysis_returns_all_keys_required_by_trading():
         "strong_trend", "uptrend", "sar_below_price", "sar_above_price",
         "near_upper_band", "near_lower_band", "bb_squeeze",
         "bullish_crossover", "bearish_crossover", "sar_flipped_to_bull", "sar_flipped_to_bear",
-        "trending_up_a_lot", "similar_to_yesterday", "dive_bombing", "current_price",
+        "trending_up_a_lot", "similar_to_yesterday", "dive_bombing",
+        "dead_cat_bounce", "extended_decline", "volatility_spike", "avoid_long",
+        "current_price",
     ]
     for k in required:
         assert k in result, f"Missing key: {k}"

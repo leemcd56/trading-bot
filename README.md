@@ -65,6 +65,8 @@ Edit **`config.py`** to change:
 | `SYMBOLS` | `['AAPL', 'TSLA', 'GOOG', 'MSFT']` | Watchlist / symbols to trade |
 | `CHECK_INTERVAL_MINUTES` | `10` | Minutes between each run |
 | `DB_PATH` | `'trends.db'` | DuckDB file for candles and trade log |
+| `TRENDS_RETAIN_DAYS` | `7` | Keep this many days of candle data; older rows are pruned each run |
+| `TRADE_LOG_RETAIN_DAYS` | `30` | Keep this many days of trade log; older rows pruned (weekly count needs 7+) |
 | `MAX_DAILY_TRADES` | `3` | Max new orders in rolling 24 hours |
 | `MAX_WEEKLY_TRADES` | `8` | Max new orders in rolling 7 days |
 | `MAX_OPEN_POSITIONS` | `4` | Max symbols held at once (no new BUY above this) |
@@ -78,6 +80,9 @@ Edit **`config.py`** to change:
 
 - **`data_fetch.fetch_and_store(symbol)`**  
   Fetches 1-minute candles from Finnhub for the last ~2000 minutes, upserts into DuckDB table `trends` (symbol, timestamp, open, high, low, close, volume). Retries on 429 (rate limit) and 5xx with exponential backoff.
+
+- **Data retention and pruning**  
+  Each run, after processing all symbols, the bot prunes old rows so the DB doesn’t grow forever. **trends**: rows with `timestamp` older than `TRENDS_RETAIN_DAYS` (default 7) are deleted. **trade_log**: rows with `timestamp_utc` older than `TRADE_LOG_RETAIN_DAYS` (default 30) are deleted. Set either to `0` to disable that prune. Analysis only uses the last 300 bars (~5 h); 7 days of 1-min data is plenty. Weekly trade counts need at least 7 days of trade log, so keep `TRADE_LOG_RETAIN_DAYS` ≥ 7.
 
 ### Analysis (indicators and signals)
 
@@ -95,7 +100,13 @@ Edit **`config.py`** to change:
 - **SMA (50)** — longer-term trend (price > SMA_50 for buy bias).
 - **Yesterday comparison** — avoid new entries when price is within 2% of prior day’s close.
 
-**Signals returned (examples):** `strong_trend`, `uptrend`, `sar_below_price`, `sar_above_price`, `near_upper_band`, `near_lower_band`, `bb_squeeze`, `bullish_crossover`, `bearish_crossover`, `sar_flipped_to_bull`, `sar_flipped_to_bear`, `trending_up_a_lot`, `similar_to_yesterday`, `dive_bombing`, `current_price`.
+**Longer-term risk (avoid longs):** The bot computes several multi-bar patterns that indicate risky entry and sets `avoid_long` if any are true. No BUY is placed when `avoid_long` is True.
+
+- **Dead-cat bounce** (`dead_cat_bounce`): Over the last 80 bars, a sharp drop (>5% high-to-low) followed by a bounce (price up 1–15% from the low) with the low in the recent half of the window. Often a failed rebound; avoids buying into it.
+- **Extended decline** (`extended_decline`): Price is still more than 7% below the 50-bar high. Indicates we’re in a drawdown; avoids catching a falling knife.
+- **Volatility spike** (`volatility_spike`): Current ATR(14) is more than 1.5× the ATR from the prior 14-bar window. Entering when volatility has just spiked is risky.
+
+**Signals returned (examples):** `strong_trend`, `uptrend`, `sar_below_price`, `sar_above_price`, `near_upper_band`, `near_lower_band`, `bb_squeeze`, `bullish_crossover`, `bearish_crossover`, `sar_flipped_to_bull`, `sar_flipped_to_bear`, `trending_up_a_lot`, `similar_to_yesterday`, `dive_bombing`, `dead_cat_bounce`, `extended_decline`, `volatility_spike`, `avoid_long`, `current_price`.
 
 **Data quality:** If the latest bar is older than 45 minutes (production only), analysis returns `None` so the bot doesn’t trade on stale data.
 
@@ -106,7 +117,7 @@ Edit **`config.py`** to change:
 
 1. **Risk limits** — If daily or weekly trade cap is reached, or open positions are at max, no new BUY; log and return.
 2. **Stop-loss** — If the symbol has an open position and `current_price <= entry * (1 - STOP_LOSS_PCT)`, submit a market SELL for the full position, log, and return.
-3. **BUY** — Only if all of: `strong_trend`, `trending_up_a_lot`, `near_upper_band`, `sar_below_price`, (bullish crossover or SAR flip to bull), not `similar_to_yesterday`, not `bb_squeeze`, and under `MAX_OPEN_POSITIONS`. Submits market BUY, qty=1.
+3. **BUY** — Only if all of: `strong_trend`, `trending_up_a_lot`, `near_upper_band`, `sar_below_price`, (bullish crossover or SAR flip to bull), not `similar_to_yesterday`, not `bb_squeeze`, not `avoid_long`, and under `MAX_OPEN_POSITIONS`. Submits market BUY, qty=1.
 4. **SELL** — If any of: `near_lower_band`, `sar_above_price`, `sar_flipped_to_bear`, `dive_bombing`, `bearish_crossover`, and we have a position, submit market SELL for full qty.
 5. Otherwise log “No signal” with the reasons (e.g. which condition failed).
 

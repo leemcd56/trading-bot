@@ -67,6 +67,7 @@ def analyze_trends(symbol: str, connection=None) -> dict | None:
     df['MACD'] = macd
     df['MACD_signal'] = signal
     df['SMA_50'] = talib.SMA(df['close'], timeperiod=50)
+    df['ATR_14'] = talib.ATR(df['high'].values, df['low'].values, df['close'].values, timeperiod=14)
 
     latest = df.iloc[-1]
     previous = df.iloc[-2] if len(df) >= 2 else None
@@ -161,6 +162,45 @@ def analyze_trends(symbol: str, connection=None) -> dict | None:
         and pct_drop > 0.02
     )
 
+    # ─── Longer-term risk: avoid buying when situation is clearly risky ───
+    lookback = 80
+    if len(df) >= lookback:
+        window_high = float(df["high"].iloc[-lookback:].max())
+        window_low = float(df["low"].iloc[-lookback:].min())
+        low_pos = int(np.argmin(df["low"].iloc[-lookback:].values))
+        drop_pct = (window_high - window_low) / window_high if window_high > 0 else 0
+        bounce_pct = (close - window_low) / window_low if window_low > 0 else 0
+        # Dead-cat bounce: sharp drop (>5%) then bounce (1–15% from low) with low in recent half of window
+        low_is_recent = low_pos >= lookback // 2
+        dead_cat_bounce = (
+            drop_pct > 0.05
+            and 0.01 < bounce_pct < 0.15
+            and low_is_recent
+        )
+    else:
+        dead_cat_bounce = False
+
+    # Extended decline: price still >7% below 50-bar high (catching a falling knife)
+    if len(df) >= 50:
+        period_high_50 = float(df["high"].iloc[-50:].max())
+        extended_decline = period_high_50 > 0 and close < period_high_50 * 0.93
+    else:
+        extended_decline = False
+
+    # Volatility spike: recent ATR much higher than prior period → risky to enter
+    if len(df) >= 28 and "ATR_14" in df.columns:
+        atr_series = df["ATR_14"].dropna()
+        if len(atr_series) >= 28:
+            atr_recent = float(atr_series.iloc[-1])
+            atr_older = float(atr_series.iloc[-28:-14].mean())
+            volatility_spike = atr_older > 0 and atr_recent > 1.5 * atr_older
+        else:
+            volatility_spike = False
+    else:
+        volatility_spike = False
+
+    avoid_long = dead_cat_bounce or extended_decline or volatility_spike
+
     return {
         "strong_trend": strong_trend,
         "uptrend": uptrend,
@@ -176,5 +216,9 @@ def analyze_trends(symbol: str, connection=None) -> dict | None:
         "trending_up_a_lot": trending_up_a_lot,
         "similar_to_yesterday": similar_to_yesterday,
         "dive_bombing": dive_bombing,
+        "dead_cat_bounce": dead_cat_bounce,
+        "extended_decline": extended_decline,
+        "volatility_spike": volatility_spike,
+        "avoid_long": avoid_long,
         "current_price": close,
     }

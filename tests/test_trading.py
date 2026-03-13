@@ -81,6 +81,7 @@ def test_all_buy_conditions_submits_buy():
             "sar_flipped_to_bull": False,
             "similar_to_yesterday": False,
             "bb_squeeze": False,
+            "avoid_long": False,
         }
         trading.execute_trade("TEST", analysis)
         mock_client.submit_order.assert_called_once()
@@ -122,6 +123,27 @@ def test_sell_condition_no_position_does_not_submit():
         }
         trading.execute_trade("TEST", analysis)
         mock_client.get_position.assert_called_with("TEST")
+        mock_client.submit_order.assert_not_called()
+
+
+def test_avoid_long_blocks_buy():
+    """When avoid_long is True (e.g. dead-cat bounce), do not BUY even if other conditions met."""
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client:
+        mock_client.get_all_positions.return_value = []
+        mock_client.get_position.side_effect = Exception("position does not exist")
+        analysis = {
+            "strong_trend": True,
+            "uptrend": True,
+            "trending_up_a_lot": True,
+            "near_upper_band": True,
+            "sar_below_price": True,
+            "bullish_crossover": True,
+            "sar_flipped_to_bull": False,
+            "similar_to_yesterday": False,
+            "bb_squeeze": False,
+            "avoid_long": True,
+        }
+        trading.execute_trade("TEST", analysis)
         mock_client.submit_order.assert_not_called()
 
 
