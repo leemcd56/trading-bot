@@ -13,12 +13,17 @@ import trading
 
 
 def _patch_trade_limits():
-    """Avoid touching real DB in tests: mock trade log to allow trades."""
+    """Avoid touching real DB in tests: mock trade log and PDT/trail to allow trades."""
     return patch.multiple(
         trading,
         _count_daily=lambda: 0,
         _count_weekly=lambda: 0,
-        _record_trade=lambda symbol, side: None,
+        _record_trade=lambda symbol, side, qty=0: None,
+        _should_block_sell_pdt=lambda symbol: False,
+        _count_day_trades_in_last_5_days=lambda: 0,
+        _get_trail_running_high=lambda symbol: None,
+        _set_trail_running_high=lambda symbol, running_high: None,
+        _clear_trail_state=lambda symbol: None,
     )
 
 
@@ -289,4 +294,165 @@ def test_notional_mode_skips_when_buying_power_below_minimum():
         analysis = _buy_conditions_for_notional()
         analysis["current_price"] = 200.0
         trading.execute_trade("TEST", analysis)
+        mock_client.submit_order.assert_not_called()
+
+
+# ─── PDT awareness ───
+
+
+def test_pdt_blocks_stop_loss_sell():
+    """When PDT limit reached, stop-loss SELL is skipped (no order submitted)."""
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "_should_block_sell_pdt", return_value=True):
+        mock_client.get_position.return_value = MagicMock(
+            qty=1,
+            avg_entry_price="100.0",
+        )
+        analysis = {
+            "strong_trend": True,
+            "current_price": 94.0,  # below stop-loss threshold
+        }
+        trading.execute_trade("TEST", analysis)
+        mock_client.get_position.assert_called_with("TEST")
+        mock_client.submit_order.assert_not_called()
+
+
+def test_pdt_blocks_signal_sell():
+    """When PDT limit reached, signal-based SELL is skipped."""
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "_should_block_sell_pdt", return_value=True):
+        mock_client.get_position.return_value = MagicMock(qty=1, avg_entry_price="100.0")
+        analysis = {
+            "strong_trend": True,
+            "current_price": 98.0,  # above stop-loss so we don't hit that branch
+            "near_lower_band": True,
+            "sar_above_price": False,
+            "sar_flipped_to_bear": False,
+            "dive_bombing": False,
+            "bearish_crossover": False,
+        }
+        trading.execute_trade("TEST", analysis)
+        mock_client.get_position.assert_called_with("TEST")
+        mock_client.submit_order.assert_not_called()
+
+
+def test_pdt_blocks_trailing_stop_sell():
+    """When PDT limit reached, trailing-stop SELL is skipped."""
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "_should_block_sell_pdt", return_value=True), \
+         patch.object(trading, "_get_trail_running_high", return_value=110.0):
+        mock_client.get_position.return_value = MagicMock(
+            qty=1,
+            avg_entry_price="100.0",
+        )
+        analysis = {
+            "strong_trend": True,
+            "current_price": 105.5,  # would trigger trailing stop (below 110*0.96)
+            "trending_up_a_lot": False,
+            "near_upper_band": False,
+            "sar_below_price": False,
+            "bullish_crossover": False,
+            "sar_flipped_to_bull": False,
+            "similar_to_yesterday": False,
+            "bb_squeeze": False,
+            "near_lower_band": False,
+            "sar_above_price": False,
+            "sar_flipped_to_bear": False,
+            "dive_bombing": False,
+            "bearish_crossover": False,
+        }
+        trading.execute_trade("TEST", analysis)
+        mock_client.submit_order.assert_not_called()
+
+
+# ─── Trailing stop ───
+
+
+def test_trailing_stop_sells_when_active_and_price_drops_from_high():
+    """When trail is active (price was 5%+ above entry) and price drops 4% from running high, submit SELL."""
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client:
+        mock_client.get_position.return_value = MagicMock(
+            qty=2,
+            avg_entry_price="100.0",
+        )
+        # Running high was 110; current now 105.5 -> 105.5 <= 110 * 0.96 = 105.6, so trail triggers
+        with patch.object(trading, "_get_trail_running_high", return_value=110.0):
+            analysis = {
+                "strong_trend": True,
+                "current_price": 105.5,
+                "trending_up_a_lot": False,
+                "near_upper_band": False,
+                "sar_below_price": False,
+                "bullish_crossover": False,
+                "sar_flipped_to_bull": False,
+                "similar_to_yesterday": False,
+                "bb_squeeze": False,
+                "near_lower_band": False,
+                "sar_above_price": False,
+                "sar_flipped_to_bear": False,
+                "dive_bombing": False,
+                "bearish_crossover": False,
+            }
+            trading.execute_trade("TEST", analysis)
+        mock_client.submit_order.assert_called_once()
+        order = mock_client.submit_order.call_args[0][0]
+        assert order.side == OrderSide.SELL
+        assert float(order.qty) == 2
+
+
+def test_trailing_stop_does_not_sell_when_not_activated():
+    """When price is not yet 5% above entry, trailing stop is not active; no SELL from trail."""
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client:
+        mock_client.get_position.return_value = MagicMock(
+            qty=1,
+            avg_entry_price="100.0",
+        )
+        # Current 103 = 3% above entry; trail activates at 105. No trail trigger.
+        with patch.object(trading, "_get_trail_running_high", return_value=103.0):
+            analysis = {
+                "strong_trend": True,
+                "current_price": 103.0,
+                "trending_up_a_lot": False,
+                "near_upper_band": False,
+                "sar_below_price": False,
+                "bullish_crossover": False,
+                "sar_flipped_to_bull": False,
+                "similar_to_yesterday": False,
+                "bb_squeeze": False,
+                "near_lower_band": False,
+                "sar_above_price": False,
+                "sar_flipped_to_bear": False,
+                "dive_bombing": False,
+                "bearish_crossover": False,
+            }
+            trading.execute_trade("TEST", analysis)
+        mock_client.submit_order.assert_not_called()
+
+
+def test_trailing_stop_does_not_sell_when_price_has_not_dropped_enough():
+    """When trail is active but price has not fallen 4% from running high, no SELL."""
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client:
+        mock_client.get_position.return_value = MagicMock(
+            qty=1,
+            avg_entry_price="100.0",
+        )
+        # Running high 110, current 108. Trail active (108 >= 105). 108 <= 110*0.96=105.6? No.
+        with patch.object(trading, "_get_trail_running_high", return_value=110.0):
+            analysis = {
+                "strong_trend": True,
+                "current_price": 108.0,
+                "trending_up_a_lot": False,
+                "near_upper_band": False,
+                "sar_below_price": False,
+                "bullish_crossover": False,
+                "sar_flipped_to_bull": False,
+                "similar_to_yesterday": False,
+                "bb_squeeze": False,
+                "near_lower_band": False,
+                "sar_above_price": False,
+                "sar_flipped_to_bear": False,
+                "dive_bombing": False,
+                "bearish_crossover": False,
+            }
+            trading.execute_trade("TEST", analysis)
         mock_client.submit_order.assert_not_called()
