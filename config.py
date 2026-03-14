@@ -26,6 +26,14 @@ MAX_OPEN_POSITIONS = 4  # max symbols held at once (across SYMBOLS)
 # Stop-loss: sell if position is down this much from average entry (e.g. 0.05 = 5%)
 STOP_LOSS_PCT = 0.05
 
+# PDT: max day trades in a rolling 5 calendar-day window (stay under 4 to avoid PDT flag)
+MAX_DAY_TRADES_IN_5_DAYS = 3
+
+# Trailing stop: activate when price is this much above entry (e.g. 0.05 = 5%)
+TRAIL_ACTIVATION_PCT = 0.05
+# Once active, sell if price falls this much from running high (e.g. 0.04 = 4%)
+TRAIL_PCT = 0.04
+
 # Position sizing: risk this fraction of equity per trade (e.g. 0.01 = 1%)
 # Set to None to use fixed qty=1 instead of risk-based sizing (ignored when NOTIONAL_PER_TRADE is set)
 RISK_PCT_PER_TRADE = 0.01

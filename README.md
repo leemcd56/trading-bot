@@ -72,6 +72,9 @@ Edit **`config.py`** to change:
 | `MAX_WEEKLY_TRADES` | `8` | Max new orders in rolling 7 days |
 | `MAX_OPEN_POSITIONS` | `4` | Max symbols held at once (no new BUY above this) |
 | `STOP_LOSS_PCT` | `0.05` | Sell if position is down 5% from average entry (e.g. `0.03` = 3%) |
+| `MAX_DAY_TRADES_IN_5_DAYS` | `3` | PDT: max day trades in a rolling 5 calendar-day window (stay under 4 to avoid PDT flag). SELLs that would be a day trade are blocked when at limit. |
+| `TRAIL_ACTIVATION_PCT` | `0.05` | Trailing stop activates when price is 5% above entry |
+| `TRAIL_PCT` | `0.04` | Once trailing stop is active, sell if price falls 4% from the running high since activation |
 | `RISK_PCT_PER_TRADE` | `0.01` | Risk this fraction of equity per trade (1%); set to `None` for fixed qty=1 |
 | `MAX_POSITION_PCT_EQUITY` | `0.10` | Cap position value at 10% of equity per symbol |
 | `MIN_SHARES` / `MAX_SHARES` | `1` / `100` | Clamp share count when using qty-based sizing (not notional) |
@@ -121,10 +124,12 @@ Edit **`config.py`** to change:
   Uses the analysis dict to decide whether to submit orders. Order of checks:
 
 1. **Risk limits** — If daily or weekly trade cap is reached, or open positions are at max, no new BUY; log and return.
-2. **Stop-loss** — If the symbol has an open position and `current_price <= entry * (1 - STOP_LOSS_PCT)`, submit a market SELL for the full position, log, and return.
-3. **BUY** — Only if all of: `strong_trend`, `trending_up_a_lot`, `near_upper_band`, `sar_below_price`, (bullish crossover or SAR flip to bull), not `similar_to_yesterday`, not `bb_squeeze`, not `avoid_long`, and under `MAX_OPEN_POSITIONS`. If **`NOTIONAL_PER_TRADE`** is set (e.g. `75`), submits a **fractional** market BUY for that many dollars (good for small accounts). Otherwise share quantity is from **position sizing** or fixed 1. Submits market BUY.
-4. **SELL** — If any of: `near_lower_band`, `sar_above_price`, `sar_flipped_to_bear`, `dive_bombing`, `bearish_crossover`, and we have a position, submit market SELL for full qty.
-5. Otherwise log “No signal” with the reasons (e.g. which condition failed).
+2. **Stop-loss** — If the symbol has an open position and `current_price <= entry * (1 - STOP_LOSS_PCT)`, submit a market SELL for the full position (unless blocked by PDT), log, and return.
+3. **Trailing stop** — If the symbol has an open position and price has been at least `TRAIL_ACTIVATION_PCT` above entry, the bot tracks a running high. If price then falls by `TRAIL_PCT` from that running high, submit a market SELL (unless blocked by PDT). State is persisted in DuckDB so the trail survives restarts.
+4. **PDT** — Before any SELL (stop-loss, trailing stop, or signal), if that SELL would be a day trade (same symbol bought and sold today) and the number of day trades in the last 5 calendar days is already at `MAX_DAY_TRADES_IN_5_DAYS`, the SELL is skipped and an alert is sent. Trade log stores `qty` for accurate day-trade counting.
+5. **BUY** — Only if all of: `strong_trend`, `trending_up_a_lot`, `near_upper_band`, `sar_below_price`, (bullish crossover or SAR flip to bull), not `similar_to_yesterday`, not `bb_squeeze`, not `avoid_long`, and under `MAX_OPEN_POSITIONS`. If **`NOTIONAL_PER_TRADE`** is set (e.g. `75`), submits a **fractional** market BUY for that many dollars (good for small accounts). Otherwise share quantity is from **position sizing** or fixed 1. Submits market BUY.
+6. **SELL (signal)** — If any of: `near_lower_band`, `sar_above_price`, `sar_flipped_to_bear`, `dive_bombing`, `bearish_crossover`, and we have a position (and not blocked by PDT), submit market SELL for full qty.
+7. Otherwise log “No signal” with the reasons (e.g. which condition failed).
 
 **Fractional / notional mode:** If `config.NOTIONAL_PER_TRADE` is set (e.g. `75`), each BUY is normally a **dollar amount** (e.g. $75) via Alpaca’s notional order—you get fractional shares. If the stock’s current price is **less than or equal** to that amount (e.g. $45 ≤ $75) and you have the cash, the bot buys **one whole share** instead of the dollar amount. Ideal for small accounts and mixed watchlists (cheap names get whole shares; expensive ones get fractional). The bot caps notional at your buying power and skips if below Alpaca’s $1 minimum. Set to `None` to use share-based sizing.
 
@@ -132,7 +137,7 @@ Edit **`config.py`** to change:
 
 **Stop-loss:** Uses Alpaca’s `avg_entry_price` and `analysis['current_price']`. When price is down by at least `STOP_LOSS_PCT` from entry, the position is closed with a market sell. Checked every run before other signals.
 
-**Trade log:** Every submitted order (BUY or SELL) is appended to DuckDB table `trade_log` (timestamp_utc, symbol, side). Daily and weekly limits are computed from this table so they persist across restarts.
+**Trade log:** Every submitted order (BUY or SELL) is appended to DuckDB table `trade_log` (timestamp_utc, symbol, side, qty). Daily and weekly limits are computed from this table; `qty` is used for PDT day-trade counting (rolling 5 calendar days). State for the trailing stop (running high per symbol) is stored in `trail_state` and cleared when the position is closed.
 
 ### Scheduler and utils
 

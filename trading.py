@@ -1,6 +1,7 @@
 # trading.py
 import os
 import time
+from collections import defaultdict
 import duckdb
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
@@ -20,6 +21,9 @@ from config import (
     MIN_SHARES,
     MAX_SHARES,
     NOTIONAL_PER_TRADE,
+    MAX_DAY_TRADES_IN_5_DAYS,
+    TRAIL_ACTIVATION_PCT,
+    TRAIL_PCT,
 )
 
 load_dotenv()
@@ -33,6 +37,7 @@ trading_client = TradingClient(
 )
 
 TRADE_LOG_TABLE = "trade_log"
+TRAIL_STATE_TABLE = "trail_state"
 
 
 def _ensure_trade_log(con: duckdb.DuckDBPyConnection) -> None:
@@ -40,20 +45,36 @@ def _ensure_trade_log(con: duckdb.DuckDBPyConnection) -> None:
         CREATE TABLE IF NOT EXISTS {TRADE_LOG_TABLE} (
             timestamp_utc DOUBLE,
             symbol VARCHAR,
-            side VARCHAR
+            side VARCHAR,
+            qty DOUBLE
+        )
+    """)
+    # Migration: add qty if table existed without it
+    try:
+        con.execute(f"ALTER TABLE {TRADE_LOG_TABLE} ADD COLUMN qty DOUBLE")
+    except Exception:
+        pass  # column already exists
+
+
+def _ensure_trail_state(con: duckdb.DuckDBPyConnection) -> None:
+    con.execute(f"""
+        CREATE TABLE IF NOT EXISTS {TRAIL_STATE_TABLE} (
+            symbol VARCHAR PRIMARY KEY,
+            running_high DOUBLE,
+            updated_at DOUBLE
         )
     """)
 
 
-def _record_trade(symbol: str, side: str) -> None:
-    """Persist trade to DuckDB for daily/weekly limit counts."""
+def _record_trade(symbol: str, side: str, qty: float = 0) -> None:
+    """Persist trade to DuckDB for daily/weekly limit counts and PDT. qty=0 for unknown (e.g. notional)."""
     con = duckdb.connect(DB_PATH)
     try:
         _ensure_trade_log(con)
         ts = time.time()
         con.execute(
-            f"INSERT INTO {TRADE_LOG_TABLE} (timestamp_utc, symbol, side) VALUES (?, ?, ?)",
-            [ts, symbol, side],
+            f"INSERT INTO {TRADE_LOG_TABLE} (timestamp_utc, symbol, side, qty) VALUES (?, ?, ?, ?)",
+            [ts, symbol, side, qty if qty else 0],
         )
     finally:
         con.close()
@@ -95,6 +116,68 @@ def _count_weekly() -> int:
         con.close()
 
 
+def _count_day_trades_in_last_5_days() -> int:
+    """
+    Count day trades in the rolling past 5 calendar days (UTC).
+    A day trade = a SELL that closes shares bought the same day.
+    Uses qty when present; treats 0/NULL as 1 for conservative count.
+    """
+    con = duckdb.connect(DB_PATH)
+    try:
+        _ensure_trade_log(con)
+        cutoff = time.time() - 5 * 86400
+        rows = con.execute(
+            f"SELECT timestamp_utc, symbol, side, qty FROM {TRADE_LOG_TABLE} WHERE timestamp_utc >= ? ORDER BY timestamp_utc",
+            [cutoff],
+        ).fetchall()
+    finally:
+        con.close()
+    # Group by (day_id, symbol); day_id = UTC day
+    groups = defaultdict(list)
+    for ts, sym, side, qty in rows:
+        day_id = int(ts // 86400)
+        q = max(1, float(qty or 0)) if qty is not None else 1
+        groups[(day_id, sym)].append((ts, side, q))
+    total_day_trades = 0
+    for key, events in groups.items():
+        events.sort(key=lambda x: x[0])
+        same_day_bought = 0.0
+        for _ts, side, q in events:
+            if side.upper() == "BUY":
+                same_day_bought += q
+            else:
+                close_qty = min(q, same_day_bought)
+                same_day_bought -= close_qty
+                if close_qty > 0:
+                    total_day_trades += 1
+    return total_day_trades
+
+
+def _would_sell_be_day_trade(symbol: str) -> bool:
+    """True if we have any BUY of this symbol today (UTC); selling would then be a day trade."""
+    con = duckdb.connect(DB_PATH)
+    try:
+        _ensure_trade_log(con)
+        now = time.time()
+        today_start = (int(now) // 86400) * 86400
+        out = con.execute(
+            f"SELECT 1 FROM {TRADE_LOG_TABLE} WHERE timestamp_utc >= ? AND timestamp_utc < ? AND symbol = ? AND side = 'BUY' LIMIT 1",
+            [today_start, today_start + 86400, symbol],
+        ).fetchone()
+        return out is not None
+    finally:
+        con.close()
+
+
+def _should_block_sell_pdt(symbol: str) -> bool:
+    """True if we should block this SELL to avoid exceeding PDT limit (day trade count in 5 days)."""
+    if MAX_DAY_TRADES_IN_5_DAYS is None or MAX_DAY_TRADES_IN_5_DAYS < 0:
+        return False
+    if not _would_sell_be_day_trade(symbol):
+        return False
+    return _count_day_trades_in_last_5_days() >= MAX_DAY_TRADES_IN_5_DAYS
+
+
 def prune_old_trade_log() -> None:
     """Delete trade_log rows older than TRADE_LOG_RETAIN_DAYS (daily/weekly counts need 7+ days)."""
     if TRADE_LOG_RETAIN_DAYS <= 0:
@@ -107,6 +190,50 @@ def prune_old_trade_log() -> None:
         logger.debug(f"Pruned trade_log older than {TRADE_LOG_RETAIN_DAYS} days")
     except Exception as e:
         logger.warning(f"Prune trade_log failed: {e}")
+    finally:
+        con.close()
+
+
+def _get_trail_running_high(symbol: str) -> float | None:
+    """Return persisted running high for symbol, or None if not set."""
+    con = duckdb.connect(DB_PATH)
+    try:
+        _ensure_trail_state(con)
+        out = con.execute(
+            f"SELECT running_high FROM {TRAIL_STATE_TABLE} WHERE symbol = ?",
+            [symbol],
+        ).fetchone()
+        return float(out[0]) if out and out[0] is not None else None
+    finally:
+        con.close()
+
+
+def _set_trail_running_high(symbol: str, running_high: float) -> None:
+    """Upsert running high for symbol (trailing stop state)."""
+    con = duckdb.connect(DB_PATH)
+    try:
+        _ensure_trail_state(con)
+        now = time.time()
+        con.execute(
+            f"DELETE FROM {TRAIL_STATE_TABLE} WHERE symbol = ?",
+            [symbol],
+        )
+        con.execute(
+            f"INSERT INTO {TRAIL_STATE_TABLE} (symbol, running_high, updated_at) VALUES (?, ?, ?)",
+            [symbol, running_high, now],
+        )
+    finally:
+        con.close()
+
+
+def _clear_trail_state(symbol: str) -> None:
+    """Clear trailing-stop state for symbol after we sell."""
+    con = duckdb.connect(DB_PATH)
+    try:
+        _ensure_trail_state(con)
+        con.execute(f"DELETE FROM {TRAIL_STATE_TABLE} WHERE symbol = ?", [symbol])
+    except Exception as e:
+        logger.debug(f"Clear trail state failed for {symbol}: {e}")
     finally:
         con.close()
 
@@ -219,6 +346,15 @@ def execute_trade(symbol: str, analysis: dict | None):
             entry = float(position.avg_entry_price)
             current = analysis.get("current_price") or 0
             if entry > 0 and current > 0 and current <= entry * (1 - STOP_LOSS_PCT):
+                if _should_block_sell_pdt(symbol):
+                    logger.warning(
+                        f"{symbol}: Skipping stop-loss SELL - PDT limit reached ({_count_day_trades_in_last_5_days()}/{MAX_DAY_TRADES_IN_5_DAYS} day trades in 5 days)"
+                    )
+                    send_alert(
+                        f"{symbol}: Stop-loss skipped (PDT limit). Consider closing tomorrow.",
+                        "error",
+                    )
+                    return
                 order = MarketOrderRequest(
                     symbol=symbol,
                     qty=qty,
@@ -226,9 +362,37 @@ def execute_trade(symbol: str, analysis: dict | None):
                     time_in_force=TimeInForce.DAY
                 )
                 trading_client.submit_order(order)
-                _record_trade(symbol, "SELL")
+                _record_trade(symbol, "SELL", qty)
+                _clear_trail_state(symbol)
                 logger.warning(f"Stop-loss SELL for {symbol}: price {current:.2f} <= entry {entry:.2f} * (1 - {STOP_LOSS_PCT:.0%})")
                 send_alert(f"Stop-loss SELL {symbol} qty={qty:.4g} @ {current:.2f} (entry {entry:.2f})", "trade")
+                return
+            # ─── Trailing stop: after fixed stop-loss, lock in gains once price is TRAIL_ACTIVATION_PCT above entry ───
+            running_high = _get_trail_running_high(symbol)
+            if running_high is None:
+                running_high = current
+            else:
+                running_high = max(running_high, current)
+            _set_trail_running_high(symbol, running_high)
+            trail_active = current >= entry * (1 + TRAIL_ACTIVATION_PCT)
+            if trail_active and current <= running_high * (1 - TRAIL_PCT):
+                if _should_block_sell_pdt(symbol):
+                    logger.warning(
+                        f"{symbol}: Skipping trailing-stop SELL - PDT limit reached ({_count_day_trades_in_last_5_days()}/{MAX_DAY_TRADES_IN_5_DAYS} day trades in 5 days)"
+                    )
+                    send_alert(f"{symbol}: Trailing-stop skipped (PDT limit). Consider closing tomorrow.", "error")
+                    return
+                order = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=qty,
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY
+                )
+                trading_client.submit_order(order)
+                _record_trade(symbol, "SELL", qty)
+                _clear_trail_state(symbol)
+                logger.warning(f"Trailing-stop SELL for {symbol}: price {current:.2f} <= running_high {running_high:.2f} * (1 - {TRAIL_PCT:.0%})")
+                send_alert(f"Trailing-stop SELL {symbol} qty={qty:.4g} @ {current:.2f} (running_high {running_high:.2f})", "trade")
                 return
     except Exception as e:
         if "position does not exist" not in str(e).lower():
@@ -259,7 +423,7 @@ def execute_trade(symbol: str, analysis: dict | None):
                     time_in_force=TimeInForce.DAY
                 )
                 trading_client.submit_order(order)
-                _record_trade(symbol, "BUY")
+                _record_trade(symbol, "BUY", 1)
                 logger.info(f"BUY submitted for {symbol} qty=1 (whole share, price ${price:.2f} <= ${NOTIONAL_PER_TRADE})")
                 send_alert(f"BUY {symbol} 1 share @ ~${price:.2f}", "trade")
             else:
@@ -275,7 +439,7 @@ def execute_trade(symbol: str, analysis: dict | None):
                     time_in_force=TimeInForce.DAY
                 )
                 trading_client.submit_order(order)
-                _record_trade(symbol, "BUY")
+                _record_trade(symbol, "BUY", 0)
                 logger.info(f"BUY submitted for {symbol} notional=${notional:.2f}")
                 send_alert(f"BUY {symbol} ${notional:.2f}", "trade")
         else:
@@ -288,7 +452,7 @@ def execute_trade(symbol: str, analysis: dict | None):
                 time_in_force=TimeInForce.DAY
             )
             trading_client.submit_order(order)
-            _record_trade(symbol, "BUY")
+            _record_trade(symbol, "BUY", qty)
             logger.info(f"BUY submitted for {symbol} qty={qty}")
             send_alert(f"BUY {symbol} qty={qty}", "trade")
 
@@ -303,16 +467,23 @@ def execute_trade(symbol: str, analysis: dict | None):
             position = trading_client.get_position(symbol)
             qty = float(position.qty)
             if qty > 0:
-                order = MarketOrderRequest(
-                    symbol=symbol,
-                    qty=qty,
-                    side=OrderSide.SELL,
-                    time_in_force=TimeInForce.DAY
-                )
-                trading_client.submit_order(order)
-                _record_trade(symbol, "SELL")
-                logger.info(f"SELL submitted for {symbol}")
-                send_alert(f"SELL {symbol} qty={qty:.4g}", "trade")
+                if _should_block_sell_pdt(symbol):
+                    logger.warning(
+                        f"{symbol}: Skipping signal SELL - PDT limit reached ({_count_day_trades_in_last_5_days()}/{MAX_DAY_TRADES_IN_5_DAYS} day trades in 5 days)"
+                    )
+                    send_alert(f"{symbol}: Signal SELL skipped (PDT limit). Consider closing tomorrow.", "error")
+                else:
+                    order = MarketOrderRequest(
+                        symbol=symbol,
+                        qty=qty,
+                        side=OrderSide.SELL,
+                        time_in_force=TimeInForce.DAY
+                    )
+                    trading_client.submit_order(order)
+                    _record_trade(symbol, "SELL", qty)
+                    _clear_trail_state(symbol)
+                    logger.info(f"SELL submitted for {symbol}")
+                    send_alert(f"SELL {symbol} qty={qty:.4g}", "trade")
         except Exception as e:
             if "position does not exist" not in str(e).lower():
                 logger.error(f"Position check failed for {symbol}: {e}")
