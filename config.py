@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 SYMBOLS = ['AAPL', 'TSLA', 'GOOG', 'MSFT']  # your watchlist
-CHECK_INTERVAL_MINUTES = 10
+CHECK_INTERVAL_MINUTES = 60  # with daily candles, checking once per hour is plenty
 
 # Database: local file or MotherDuck (hosted DuckDB) for persistent cloud storage
 _motherduck_token = os.getenv("MOTHERDUCK_TOKEN")
@@ -15,7 +15,7 @@ DB_PATH = (
 )
 
 # Data retention (prune older rows to keep DB small)
-TRENDS_RETAIN_DAYS = 7        # keep this many days of 1-min candles per symbol
+TRENDS_RETAIN_DAYS = 365      # keep this many days of daily candles per symbol
 TRADE_LOG_RETAIN_DAYS = 30    # keep this many days of trade log (for daily/weekly counts we need 7+)
 
 # Risk limits (no new orders when at cap)

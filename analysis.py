@@ -7,8 +7,8 @@ import numpy as np
 from config import DB_PATH
 from utils import logger
 
-# Don't trade on data older than this (minutes)
-STALE_BAR_MINUTES = 45
+# Don't trade on data older than this (minutes). With daily candles, this is ~2 days.
+STALE_BAR_MINUTES = 60 * 24 * 2
 
 
 def analyze_trends(symbol: str, connection=None) -> dict | None:
@@ -23,7 +23,14 @@ def analyze_trends(symbol: str, connection=None) -> dict | None:
         ORDER BY timestamp ASC
         LIMIT 300
     """
-    df = con.execute(query).fetchdf()
+    try:
+        df = con.execute(query).fetchdf()
+    except Exception as e:
+        # Handle case where the trends table doesn't exist yet (fresh DB / failed fetch).
+        logger.warning(f"No trends data available for {symbol} (table missing or unreadable): {e}")
+        if connection is None:
+            con.close()
+        return None
     if connection is None:
         con.close()
 
@@ -146,8 +153,8 @@ def analyze_trends(symbol: str, connection=None) -> dict | None:
 
     # Similar to yesterday: |change vs prior day close| < 2%
     similar_to_yesterday = False
-    if len(df) >= 1440:
-        yesterday_close = df.iloc[-1440]["close"]
+    if len(df) >= 2:
+        yesterday_close = df["close"].iloc[-2]
         if _ok(yesterday_close) and float(yesterday_close) != 0:
             pct_change = abs(close - float(yesterday_close)) / float(yesterday_close)
             similar_to_yesterday = pct_change < 0.02
