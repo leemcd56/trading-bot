@@ -37,35 +37,36 @@ def _fetch_from_massive_daily(symbol: str, start_ts: int, end_ts: int) -> pd.Dat
     if not _massive_supported():
         return None
     try:
-        start_ms = start_ts * 1000
-        end_ms = end_ts * 1000
-        # Massive stocks aggregates endpoint: 1 day bars
-        # see https://massive.com/docs/rest/stocks/aggregates/ for latest details
-        resp = _massive_client.stocks_aggregates(
-            symbol=symbol,
-            multiplier=1,
-            timespan="day",
-            from_=start_ms,
-            to=end_ms,
+        # Massive list_aggs uses date strings, not unix timestamps
+        start_date = time.strftime("%Y-%m-%d", time.gmtime(start_ts))
+        end_date = time.strftime("%Y-%m-%d", time.gmtime(end_ts))
+        aggs = list(
+            _massive_client.list_aggs(
+                ticker=symbol,
+                multiplier=1,
+                timespan="day",
+                from_=start_date,
+                to=end_date,
+                limit=50000,
+            )
         )
-        results = getattr(resp, "results", None) or []
-        if not results:
+        if not aggs:
             return pd.DataFrame()
         rows: List[Dict[str, Any]] = []
-        for r in results:
-            # Massive uses fields like t (timestamp ms), o,h,l,c,v
-            t_ms = getattr(r, "t", None) or r.get("t")
+        for r in aggs:
+            # Massive uses attributes like t (timestamp ms), o,h,l,c,v
+            t_ms = getattr(r, "t", None) or getattr(r, "timestamp", None) or getattr(r, "T", None)
             if t_ms is None:
                 continue
             rows.append(
                 {
                     "symbol": symbol,
                     "timestamp": int(t_ms // 1000),
-                    "open": getattr(r, "o", None) or r.get("o"),
-                    "high": getattr(r, "h", None) or r.get("h"),
-                    "low": getattr(r, "l", None) or r.get("l"),
-                    "close": getattr(r, "c", None) or r.get("c"),
-                    "volume": getattr(r, "v", None) or r.get("v") or 0,
+                    "open": getattr(r, "o", None),
+                    "high": getattr(r, "h", None),
+                    "low": getattr(r, "l", None),
+                    "close": getattr(r, "c", None),
+                    "volume": getattr(r, "v", None) or 0,
                 }
             )
         return pd.DataFrame(rows)

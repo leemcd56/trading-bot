@@ -7,8 +7,9 @@ import numpy as np
 from config import DB_PATH
 from utils import logger
 
-# Don't trade on data older than this (minutes). With daily candles, this is ~2 days.
-STALE_BAR_MINUTES = 60 * 24 * 2
+# Don't trade on data older than this (minutes).
+# With daily candles, allow up to ~7 days to account for weekends/holidays/provider delays.
+STALE_BAR_MINUTES = 60 * 24 * 7
 
 
 def analyze_trends(symbol: str, connection=None) -> dict | None:
