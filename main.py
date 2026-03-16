@@ -39,6 +39,9 @@ if __name__ == "__main__":
     schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(job)
 
     logger.info("Trading bot started...")
+    # Run first cycle immediately so we see activity right away (e.g. in Railway logs).
+    job()
+
     while True:
         schedule.run_pending()
         time.sleep(1)
