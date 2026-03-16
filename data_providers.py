@@ -1,13 +1,18 @@
 """
-Unified data providers for candles with failover.
+Unified data providers for candles and prices with failover.
 
-Primary: Massive (Daily Ticker Summary via RESTClient.get_daily_open_close_agg)
-Fallbacks: Yahoo Finance (yfinance), Finnhub (if FINNHUB_API_KEY set)
+Daily candles:
+- Primary: Massive (Daily Ticker Summary via RESTClient.get_daily_open_close_agg) for latest EOD
+- Historical + backfill: Yahoo Finance (yfinance), Finnhub (if FINNHUB_API_KEY set)
+
+Intraday price:
+- Primary: Yahoo Finance 1-minute bars
+- Fallback: last stored close (via caller) or other providers if extended later
 """
 import os
 import time
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import requests
 import pandas as pd
@@ -188,26 +193,49 @@ def get_daily_candles_with_failover(symbol: str, lookback_days: int = 365) -> pd
     start_ts = int(now - lookback_days * 86400)
     end_ts = int(now)
 
-    # Massive first
-    df = _fetch_from_massive_daily(symbol, start_ts, end_ts)
-    if df is not None:
-        if len(df):
-            logger.info(f"Fetched {len(df)} daily bars for {symbol} from Massive")
-        return df
-
-    # Yahoo Finance
+    # 1) Historical window from Yahoo first (cheapest/free for history)
     df = _fetch_from_yahoo_daily(symbol, start_ts, end_ts)
-    if df is not None:
-        if len(df):
-            logger.info(f"Fetched {len(df)} daily bars for {symbol} from Yahoo Finance")
-        return df
+    if df is None:
+        df = pd.DataFrame()
 
-    # Finnhub as last resort (if configured)
-    df = _fetch_from_finnhub_daily(symbol, start_ts, end_ts)
-    if df is not None and len(df):
-        logger.info(f"Fetched {len(df)} daily bars for {symbol} from Finnhub")
-        return df
+    # 2) Optionally overlay latest EOD from Massive for the most recent market day
+    latest_eod = _fetch_from_massive_daily(symbol, start_ts, end_ts)
+    if latest_eod is not None and len(latest_eod) > 0:
+        # Keep everything except rows on/after Massive's last timestamp, then append Massive rows
+        latest_ts = int(latest_eod["timestamp"].max())
+        if not df.empty:
+            df = df[df["timestamp"] < latest_ts]
+        df = pd.concat([df, latest_eod], ignore_index=True).sort_values("timestamp")
+        logger.info(f"Overlayed latest EOD for {symbol} from Massive")
 
-    logger.warning(f"No daily candles available for {symbol} from any provider")
-    return pd.DataFrame()
+    # 3) If still empty, try Finnhub as last resort
+    if df.empty:
+        df_fh = _fetch_from_finnhub_daily(symbol, start_ts, end_ts)
+        if df_fh is not None and len(df_fh):
+            logger.info(f"Fetched {len(df_fh)} daily bars for {symbol} from Finnhub")
+            return df_fh
+
+    if df.empty:
+        logger.warning(f"No daily candles available for {symbol} from any provider")
+    return df.reset_index(drop=True)
+
+
+def get_intraday_price(symbol: str) -> Optional[float]:
+    """
+    Fetch a recent intraday price for a symbol.
+    Primary: Yahoo Finance 1-minute bars for today, last Close.
+    Returns None on failure; callers should fall back to last daily close if needed.
+    """
+    try:
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period="1d", interval="1m", auto_adjust=False)
+        if hist.empty or "Close" not in hist.columns:
+            return None
+        price = float(hist["Close"].iloc[-1])
+        if price <= 0:
+            return None
+        return price
+    except Exception as e:
+        logger.warning(f"Intraday price fetch failed for {symbol} via Yahoo: {e}")
+        return None
 

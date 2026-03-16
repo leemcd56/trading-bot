@@ -5,6 +5,7 @@ import pandas as pd
 import talib
 import numpy as np
 from config import DB_PATH
+from data_providers import get_intraday_price
 from utils import logger
 
 # Don't trade on data older than this (minutes).
@@ -213,6 +214,10 @@ def analyze_trends(symbol: str, connection=None) -> dict | None:
     atr_14 = latest.get("ATR_14") if "ATR_14" in df.columns else None
     atr_14_float = float(atr_14) if _ok(atr_14) else None
 
+    # Try to override close with a fresher intraday price when available
+    intraday_price = get_intraday_price(symbol)
+    current_price = float(intraday_price) if intraday_price and intraday_price > 0 else close
+
     return {
         "strong_trend": strong_trend,
         "uptrend": uptrend,
@@ -232,6 +237,6 @@ def analyze_trends(symbol: str, connection=None) -> dict | None:
         "extended_decline": extended_decline,
         "volatility_spike": volatility_spike,
         "avoid_long": avoid_long,
-        "current_price": close,
+        "current_price": current_price,
         "atr_14": atr_14_float,
     }
