@@ -8,3 +8,5 @@ requests
 schedule
 pytz
 pytest
+massive
+yfinance
