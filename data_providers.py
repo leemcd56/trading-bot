@@ -1,11 +1,12 @@
 """
 Unified data providers for candles with failover.
 
-Primary: Massive (RESTClient aggregates)
+Primary: Massive (Daily Ticker Summary via RESTClient.get_daily_open_close_agg)
 Fallbacks: Yahoo Finance (yfinance), Finnhub (if FINNHUB_API_KEY set)
 """
 import os
 import time
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any
 
 import requests
@@ -21,58 +22,88 @@ FINNHUB_BASE = "https://finnhub.io/api/v1/stock/candle"
 
 _massive_api_key = os.getenv("MASSIVE_API_KEY")
 _finnhub_api_key = os.getenv("FINNHUB_API_KEY")
-
-_massive_client = RESTClient(api_key=_massive_api_key) if _massive_api_key else None
+_massive_client = RESTClient(_massive_api_key) if _massive_api_key else None
 
 
 def _massive_supported() -> bool:
     return _massive_client is not None
 
 
+def _get_response_value(resp: Any, key: str, default: Any = None) -> Any:
+    """Read from client response (dict or object)."""
+    if hasattr(resp, "get"):
+        return resp.get(key, default)
+    return getattr(resp, key, default)
+
+
 def _fetch_from_massive_daily(symbol: str, start_ts: int, end_ts: int) -> pd.DataFrame | None:
     """
-    Fetch daily candles from Massive between start_ts and end_ts (Unix seconds).
-    Returns DataFrame or None on hard failure.
+    Fetch daily candles from Massive using RESTClient.get_daily_open_close_agg:
+    Daily Ticker Summary = one ticker, one date; response has open, high, low, close, volume, from.
     """
     if not _massive_supported():
         return None
-    try:
-        # Massive list_aggs uses date strings, not unix timestamps
-        start_date = time.strftime("%Y-%m-%d", time.gmtime(start_ts))
-        end_date = time.strftime("%Y-%m-%d", time.gmtime(end_ts))
-        aggs = list(
-            _massive_client.list_aggs(
-                ticker=symbol,
-                multiplier=1,
-                timespan="day",
-                from_=start_date,
-                to=end_date,
-                limit=50000,
+    rows: List[Dict[str, Any]] = []
+    start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
+    end_dt = datetime.fromtimestamp(end_ts, tz=timezone.utc)
+    current = start_dt.date()
+    end_date = end_dt.date()
+    while current <= end_date:
+        date_str = current.strftime("%Y-%m-%d")
+        try:
+            request = _massive_client.get_daily_open_close_agg(
+                symbol,
+                date_str,
+                adjusted="true",
             )
-        )
-        if not aggs:
-            return pd.DataFrame()
-        rows: List[Dict[str, Any]] = []
-        for r in aggs:
-            # Massive uses attributes like t (timestamp ms), o,h,l,c,v
-            t_ms = getattr(r, "t", None) or getattr(r, "timestamp", None) or getattr(r, "T", None)
-            if t_ms is None:
+        except Exception as e:
+            # Auth (401/403) or server errors: fail fast so we can fall back to Yahoo
+            err_str = str(e).lower()
+            if "401" in err_str or "403" in err_str or "unauthorized" in err_str or "forbidden" in err_str:
+                logger.warning(f"Massive auth failed; skipping provider: {e}")
+                return None
+            if "429" in err_str or "rate" in err_str:
+                logger.warning("Massive rate limit (429); backing off")
+                time.sleep(60)
                 continue
-            rows.append(
-                {
-                    "symbol": symbol,
-                    "timestamp": int(t_ms // 1000),
-                    "open": getattr(r, "o", None),
-                    "high": getattr(r, "h", None),
-                    "low": getattr(r, "l", None),
-                    "close": getattr(r, "c", None),
-                    "volume": getattr(r, "v", None) or 0,
-                }
+            logger.warning(f"Massive request failed for {symbol} {date_str}: {e}")
+            current = current + timedelta(days=1)
+            continue
+
+        status = _get_response_value(request, "status")
+        if status and status != "OK":
+            current = current + timedelta(days=1)
+            continue
+        open_ = _get_response_value(request, "open")
+        high = _get_response_value(request, "high")
+        low = _get_response_value(request, "low")
+        close = _get_response_value(request, "close")
+        volume = _get_response_value(request, "volume") or 0
+        from_str = _get_response_value(request, "from") or date_str
+        if close is None:
+            current = current + timedelta(days=1)
+            continue
+        try:
+            dt = datetime.strptime(from_str, "%Y-%m-%d").replace(
+                hour=23, minute=59, second=59, tzinfo=timezone.utc
             )
-        return pd.DataFrame(rows)
-    except Exception as e:
-        logger.warning(f"Massive fetch failed for {symbol}: {e}")
-        return None
+            ts = int(dt.timestamp())
+        except (ValueError, TypeError):
+            ts = int(datetime.combine(current, datetime.min.time()).replace(tzinfo=timezone.utc).timestamp()) + 86400 - 1
+        rows.append({
+            "symbol": symbol,
+            "timestamp": ts,
+            "open": float(open_) if open_ is not None else float(close),
+            "high": float(high) if high is not None else float(close),
+            "low": float(low) if low is not None else float(close),
+            "close": float(close),
+            "volume": float(volume) if volume is not None else 0,
+        })
+        current = current + timedelta(days=1)
+        time.sleep(12)  # Free tier ~5 req/min
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
 
 
 def _fetch_from_yahoo_daily(symbol: str, start_ts: int, end_ts: int) -> pd.DataFrame | None:
