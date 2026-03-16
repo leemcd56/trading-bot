@@ -1,65 +1,18 @@
 """
-Backfill historical 1-min candle data from Finnhub into DuckDB for backtesting.
-Uses a dedicated table (trends_backtest by default) to avoid mixing with live data.
+Backfill historical daily candle data into DuckDB for backtesting.
+Uses unified providers (Massive → Yahoo Finance → Finnhub) and
+stores into a dedicated table (trends_backtest by default).
 """
 import argparse
-import os
 import time
-import requests
 import duckdb
 import pandas as pd
+import os
 from config import DB_PATH
 from utils import logger
-
-FINNHUB_BASE = "https://finnhub.io/api/v1/stock/candle"
-# Finnhub free tier often limits 1-min to ~1 year; chunk by day to avoid huge responses
-CHUNK_SECONDS = 86400  # 1 day
-MAX_RETRIES = 3
-RETRY_BACKOFF_SEC = 2
+from data_providers import get_daily_candles_with_failover
 
 DEFAULT_TABLE = "trends_backtest"
-
-
-def _fetch_chunk(symbol: str, from_ts: int, to_ts: int, api_key: str) -> pd.DataFrame | None:
-    params = {
-        "symbol": symbol,
-        "resolution": "1",
-        "from": from_ts,
-        "to": to_ts,
-        "token": api_key,
-    }
-    for attempt in range(MAX_RETRIES):
-        try:
-            r = requests.get(FINNHUB_BASE, params=params, timeout=60)
-            if r.status_code == 429:
-                wait = RETRY_BACKOFF_SEC ** (attempt + 1)
-                logger.warning(f"Rate limit for {symbol}, retry in {wait}s")
-                time.sleep(wait)
-                continue
-            if r.status_code >= 500:
-                time.sleep(RETRY_BACKOFF_SEC ** (attempt + 1))
-                continue
-            r.raise_for_status()
-            data = r.json()
-            break
-        except requests.RequestException as e:
-            if attempt == MAX_RETRIES - 1:
-                logger.error(f"Fetch failed for {symbol} [{from_ts}-{to_ts}]: {e}")
-                return None
-            time.sleep(RETRY_BACKOFF_SEC ** (attempt + 1))
-
-    if not data.get("t") or not data.get("c"):
-        return pd.DataFrame()
-
-    return pd.DataFrame({
-        "symbol": symbol,
-        "timestamp": data["t"],
-        "open": data["o"],
-        "high": data["h"],
-        "low": data["l"],
-        "close": data["c"],
-        "volume": data.get("v", [0] * len(data["t"])),
-    })
 
 
 def _ensure_table(con: duckdb.DuckDBPyConnection, table: str) -> None:
@@ -80,34 +33,38 @@ def backfill_symbol(
     symbol: str,
     start_ts: int,
     end_ts: int,
-    api_key: str,
     table: str = DEFAULT_TABLE,
 ) -> int:
     """Backfill one symbol from start_ts to end_ts (Unix seconds). Returns total bars inserted."""
     con = duckdb.connect(DB_PATH)
     _ensure_table(con, table)
-    total = 0
-    t = start_ts
-    while t < end_ts:
-        chunk_end = min(t + CHUNK_SECONDS, end_ts)
-        df = _fetch_chunk(symbol, t, chunk_end, api_key)
-        if df is None:
-            t = chunk_end
-            continue
-        if len(df) > 0:
-            con.register("_chunk", df)
-            con.execute(f"""
-                DELETE FROM {table}
-                WHERE symbol = ? AND timestamp >= ? AND timestamp < ?
-            """, [symbol, t, chunk_end])
-            con.execute(f"""
-                INSERT INTO {table} (symbol, timestamp, open, high, low, close, volume)
-                SELECT symbol, timestamp, open, high, low, close, volume FROM _chunk
-            """)
-            con.unregister("_chunk")
-            total += len(df)
-        t = chunk_end
-        time.sleep(0.2)  # gentle on API
+    # We use the same provider failover as live, but restricted to the requested window.
+    df_all = get_daily_candles_with_failover(symbol, lookback_days=int((end_ts - start_ts) / 86400) + 1)
+    if df_all is None or len(df_all) == 0:
+        logger.warning(f"No backfill data for {symbol} in requested range")
+        con.close()
+        return 0
+
+    df = df_all[(df_all["timestamp"] >= start_ts) & (df_all["timestamp"] < end_ts)]
+    if len(df) > 0:
+        con.register("_chunk", df)
+        con.execute(
+            f"""
+            DELETE FROM {table}
+            WHERE symbol = ? AND timestamp >= ? AND timestamp < ?
+            """,
+            [symbol, start_ts, end_ts],
+        )
+        con.execute(
+            f"""
+            INSERT INTO {table} (symbol, timestamp, open, high, low, close, volume)
+            SELECT symbol, timestamp, open, high, low, close, volume FROM _chunk
+            """
+        )
+        con.unregister("_chunk")
+        total = len(df)
+    else:
+        total = 0
     con.close()
     return total
 
@@ -119,11 +76,6 @@ def main():
     parser.add_argument("--end", type=str, required=True, help="End date YYYY-MM-DD")
     parser.add_argument("--table", type=str, default=DEFAULT_TABLE, help="DuckDB table name")
     args = parser.parse_args()
-
-    api_key = os.getenv("FINNHUB_API_KEY")
-    if not api_key:
-        logger.error("FINNHUB_API_KEY not set")
-        return 1
 
     try:
         start_dt = time.strptime(args.start, "%Y-%m-%d")
@@ -137,7 +89,7 @@ def main():
 
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
     for symbol in symbols:
-        n = backfill_symbol(symbol, start_ts, end_ts, api_key, args.table)
+        n = backfill_symbol(symbol, start_ts, end_ts, args.table)
         logger.info(f"Backfilled {symbol}: {n} bars into {args.table}")
 
     return 0
