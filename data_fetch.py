@@ -1,5 +1,5 @@
 """
-Fetch 1-min candle data from Finnhub and upsert into DuckDB table `trends`.
+Fetch daily candle data from Finnhub and upsert into DuckDB table `trends`.
 """
 import os
 import time
@@ -10,7 +10,7 @@ from config import DB_PATH, TRENDS_RETAIN_DAYS
 from utils import logger
 
 FINNHUB_BASE = "https://finnhub.io/api/v1/stock/candle"
-LOOKBACK_MINUTES = 2000
+LOOKBACK_DAYS = 365  # how many days of history to request
 MAX_RETRIES = 3
 RETRY_BACKOFF_SEC = 2  # exponential: 2, 4, 8
 
@@ -22,10 +22,10 @@ def fetch_and_store(symbol: str) -> None:
         return
 
     now = time.time()
-    from_ts = int(now - LOOKBACK_MINUTES * 60)
+    from_ts = int(now - LOOKBACK_DAYS * 86400)
     params = {
         "symbol": symbol,
-        "resolution": "1",
+        "resolution": "D",  # daily candles for Finnhub free tier
         "from": from_ts,
         "to": int(now),
         "token": api_key,

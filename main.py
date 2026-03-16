@@ -3,6 +3,7 @@ import schedule
 from data_fetch import fetch_and_store, prune_old_trends
 from analysis import analyze_trends
 from trading import execute_trade, prune_old_trade_log
+from migrations import init_db
 from utils import logger, is_market_open
 from alerts import send_alert
 from config import SYMBOLS, CHECK_INTERVAL_MINUTES
@@ -26,9 +27,18 @@ def job():
         logger.warning(f"Prune failed: {e}")
         send_alert(f"Prune failed: {e}", "error")
 
-schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(job)
+if __name__ == "__main__":
+    # Initialize database schema up front so tables exist before first run.
+    try:
+        init_db()
+    except Exception as e:
+        # If DB init fails, alert and stop; running without tables is useless.
+        send_alert(f"Database initialization failed: {e}", "error")
+        raise
 
-logger.info("Trading bot started...")
-while True:
-    schedule.run_pending()
-    time.sleep(1)
+    schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(job)
+
+    logger.info("Trading bot started...")
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
