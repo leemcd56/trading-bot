@@ -48,6 +48,10 @@ def analyze_trends(symbol: str, connection=None) -> dict | None:
     if connection is None:
         try:
             last_ts = int(df["timestamp"].iloc[-1])
+            logger.info(
+                f"{symbol}: analysis dataframe has {len(df)} rows, "
+                f"latest timestamp={last_ts}"
+            )
             if time.time() - last_ts > STALE_BAR_MINUTES * 60:
                 logger.warning(f"Stale data for {symbol} (latest bar {STALE_BAR_MINUTES}+ min old)")
                 return None
