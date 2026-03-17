@@ -60,15 +60,41 @@ def _fetch_from_yahoo_daily(symbol: str, start_ts: int, end_ts: int) -> pd.DataF
         hist = ticker.history(start=start, end=end, interval="1d", auto_adjust=False)
         if hist.empty:
             return pd.DataFrame()
-        # Ensure the index is UTC datetimes
-        if hist.index.tz is None:
-            hist.index = hist.index.tz_localize("UTC", nonexistent="shift_forward", ambiguous="NaT")
+
+        # Log shape/metadata so we can see what yfinance is actually returning in prod
+        try:
+            logger.info(
+                f"Yahoo daily raw for {symbol}: "
+                f"shape={hist.shape}, index_type={type(hist.index)}, "
+                f"index_name={hist.index.name}, columns={list(hist.columns)}"
+            )
+        except Exception:
+            pass
+
+        # Prefer a real DatetimeIndex; fall back to explicit date/datetime columns if needed.
+        if isinstance(hist.index, pd.DatetimeIndex):
+            idx = hist.index
         else:
-            hist.index = hist.index.tz_convert("UTC")
+            df_reset = hist.reset_index()
+            date_col = _col(df_reset, "Date", "Datetime")
+            if date_col is None:
+                logger.warning(
+                    f"Yahoo Finance: no datetime index or Date/Datetime column for {symbol}; "
+                    f"index_type={type(hist.index)}, columns={list(df_reset.columns)}"
+                )
+                return pd.DataFrame()
+            idx = pd.to_datetime(date_col, utc=True)
+
+        # Ensure UTC
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC", nonexistent="shift_forward", ambiguous="NaT")
+        else:
+            idx = idx.tz_convert("UTC")
 
         df = hist.copy()
-        # Use the datetime index directly for timestamps so we never confuse it with a RangeIndex
-        timestamps = pd.to_datetime(df.index, utc=True).astype("int64") // 10**9
+        # Align index-based timestamps with df rows
+        df = df.iloc[: len(idx)]
+        timestamps = idx.astype("int64") // 10**9
 
         open_col = _col(df, "Open", "open")
         high_col = _col(df, "High", "high")
