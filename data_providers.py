@@ -60,17 +60,26 @@ def _fetch_from_yahoo_daily(symbol: str, start_ts: int, end_ts: int) -> pd.DataF
         hist = ticker.history(start=start, end=end, interval="1d", auto_adjust=False)
         if hist.empty:
             return pd.DataFrame()
-        hist = hist.tz_localize("UTC", level=None, nonexistent="shift_forward", ambiguous="NaT") if hist.index.tz is None else hist
-        df = hist.reset_index()
-        # yfinance can use "Date" or "Datetime" for index name; OHLC can be "Open"/"open" etc.
-        date_col = _col(df, "Date", "Datetime", "index")
+        # Ensure the index is UTC datetimes
+        if hist.index.tz is None:
+            hist.index = hist.index.tz_localize("UTC", nonexistent="shift_forward", ambiguous="NaT")
+        else:
+            hist.index = hist.index.tz_convert("UTC")
+
+        df = hist.copy()
+        # Use the datetime index directly for timestamps so we never confuse it with a RangeIndex
+        timestamps = pd.to_datetime(df.index, utc=True).astype("int64") // 10**9
+
         open_col = _col(df, "Open", "open")
         high_col = _col(df, "High", "high")
         low_col = _col(df, "Low", "low")
         close_col = _col(df, "Close", "close")
         vol_col = _col(df, "Volume", "volume")
-        if date_col is None or close_col is None:
-            logger.warning(f"Yahoo Finance: missing date or close column for {symbol} (columns: {list(df.columns)})")
+
+        if close_col is None:
+            logger.warning(
+                f"Yahoo Finance: missing close column for {symbol} (columns: {list(df.columns)})"
+            )
             return None
         if open_col is None:
             open_col = close_col  # fallback
@@ -80,7 +89,7 @@ def _fetch_from_yahoo_daily(symbol: str, start_ts: int, end_ts: int) -> pd.DataF
             low_col = close_col
         if vol_col is None:
             vol_col = pd.Series(0.0, index=df.index)
-        timestamps = pd.to_datetime(date_col, utc=True).astype("int64") // 10**9
+
         out = pd.DataFrame(
             {
                 "symbol": symbol,
