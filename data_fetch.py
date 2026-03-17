@@ -13,6 +13,10 @@ def fetch_and_store(symbol: str) -> None:
     if df is None or len(df) == 0:
         logger.warning(f"No candle data returned for {symbol} from any provider")
         return
+    # Require at least one valid close so we never store all-null OHLC
+    if df["close"].isna().all():
+        logger.warning(f"Refusing to store {symbol}: all close values are null")
+        return
 
     con = duckdb.connect(DB_PATH)
     con.execute(
