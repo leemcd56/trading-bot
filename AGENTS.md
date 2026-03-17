@@ -5,8 +5,8 @@
 **Style**: Conservative – infrequent trades, strong trend filters, paper trading first  
 **Current Date in Conversation**: March 2026  
 **Brokerage**: Alpaca (paper mode first)  
-**Data Provider**: Finnhub (primary), alternatives: Polygon, Alpha Vantage  
-**Database**: DuckDB (file-based, columnar, lightweight)  
+**Data Provider**: Yahoo Finance (daily via yfinance) + Finnhub fallback  
+**Database**: DuckDB / MotherDuck (for backtesting & logs; live trading can run without it)  
 **Indicators Library**: TA-Lib  
 **Scheduling**: `schedule` library (every 10–15 min during market hours)  
 **Development Environment**: Cursor + Python 3.11/3.12 + venv
@@ -24,15 +24,15 @@
 trading-bot/
 ├── main.py                 # Scheduler + main loop
 ├── config.py               # SYMBOLS list, constants, intervals, RISK_PCT_PER_TRADE
-├── data_fetch.py           # fetch_and_store(symbol) → Finnhub → DuckDB
+├── data_fetch.py           # fetch_and_store(symbol) → providers → DuckDB (for backtesting / history)
 ├── backfill.py             # Historical backfill into trends_backtest for backtesting
 ├── backtest.py             # Backtest engine (reuses analyze_trends + trading rules)
-├── analysis.py             # analyze_trends(symbol) ← ALL indicators, returns atr_14 for sizing
+├── analysis.py             # analyze_trends(symbol) / analyze_trends_from_providers(symbol) ← ALL indicators, returns atr_14 for sizing
 ├── trading.py              # execute_trade(symbol, analysis) ← Alpaca, position sizing
 ├── utils.py                # is_market_open(), logger, helpers
 ├── .env                    # API keys (gitignore!)
 ├── requirements.txt
-├── trends.db               # DuckDB file (gitignore or .duckdb/)
+├── trends.db               # DuckDB file (local dev only; MotherDuck in prod)
 ├── logs/                   # bot.log + rotation if needed
 └── AGENTS.md               # ← this file
 
@@ -74,7 +74,8 @@ trading-bot/
 ## Important Files – Where the Logic Lives
 
 - **`analysis.py`**  
-  → Contains the massive `analyze_trends(symbol)` function  
+  → Contains the massive `analyze_trends(symbol)` function (reads from DuckDB / MotherDuck)  
+  → Also `analyze_trends_from_providers(symbol)`, which fetches candles directly from providers (yfinance/Finnhub) and runs the same indicator stack **without touching the DB**  
   → All TA-Lib calls, DataFrame manipulations, boolean flags  
   → Returns rich dict with every signal/metric
 
@@ -85,8 +86,8 @@ trading-bot/
 
 - **`data_fetch.py`**  
   → `fetch_and_store(symbol)`  
-  → Finnhub candle API call (1-min resolution recommended)  
-  → Upsert into DuckDB table `trends`
+  → Uses unified providers (currently yfinance daily candles + Finnhub fallback)  
+  → Upserts into DuckDB / MotherDuck table `trends` for **historical storage & backtesting**, not required for live trade decisions
 
 - **`main.py`**  
   → Simple schedule loop calling `job()` every X minutes  
