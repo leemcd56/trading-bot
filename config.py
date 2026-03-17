@@ -6,13 +6,15 @@ load_dotenv()
 SYMBOLS = ['AAPL', 'TSLA', 'GOOG', 'MSFT']  # your watchlist
 CHECK_INTERVAL_MINUTES = 60  # with daily candles, checking once per hour is plenty
 
-# Database: local file or MotherDuck (hosted DuckDB) for persistent cloud storage
+# Database: force MotherDuck (no local DuckDB fallback)
 _motherduck_token = os.getenv("MOTHERDUCK_TOKEN")
-DB_PATH = (
-    f"md:?motherduck_token={_motherduck_token}"
-    if _motherduck_token
-    else "trends.db"
-)
+if not _motherduck_token:
+    raise RuntimeError(
+        "MOTHERDUCK_TOKEN is not set. This project is configured to use MotherDuck "
+        "only and will not fall back to a local DuckDB file. "
+        "Set MOTHERDUCK_TOKEN in your environment or .env."
+    )
+DB_PATH = f"md:?motherduck_token={_motherduck_token}"
 
 # Data retention (prune older rows to keep DB small)
 TRENDS_RETAIN_DAYS = 365      # keep this many days of daily candles per symbol
