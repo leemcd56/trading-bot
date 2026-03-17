@@ -49,7 +49,25 @@ def fetch_and_store(symbol: str) -> None:
         """
     )
     con.unregister("_new_bars")
-    logger.info(f"Fetched and stored {len(df)} bars for {symbol}")
+    # Log basic stats so we can debug what the DB actually contains in environments
+    # where we can't open DuckDB directly (e.g. Railway containers).
+    try:
+        stats = con.execute(
+            """
+            SELECT symbol,
+                   COUNT(*)      AS n,
+                   MIN(timestamp) AS min_ts,
+                   MAX(timestamp) AS max_ts
+            FROM trends
+            GROUP BY symbol
+            """
+        ).fetchdf()
+        logger.info(
+            f"Fetched and stored {len(df)} bars for {symbol}; "
+            f"trends stats: {stats.to_dict(orient='records')}"
+        )
+    except Exception as e:
+        logger.warning(f"Failed to log trends stats after upsert for {symbol}: {e}")
     con.close()
 
 
