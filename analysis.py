@@ -5,47 +5,26 @@ import pandas as pd
 import talib
 import numpy as np
 from config import DB_PATH
-from data_providers import get_intraday_price
+from data_providers import get_intraday_price, get_daily_candles_with_failover
 from utils import logger
 
-# Don't trade on data older than this (minutes).
+# Don't trade on data older than this (minutes) when reading from DB.
 # With daily candles, allow up to ~7 days to account for weekends/holidays/provider delays.
 STALE_BAR_MINUTES = 60 * 24 * 7
 
 
-def analyze_trends(symbol: str, connection=None) -> dict | None:
-    """
-    Analyze trend signals for a symbol from the trends table.
-    connection: optional DuckDB connection (e.g. for tests with spoofed data).
-    """
-    con = connection if connection is not None else duckdb.connect(DB_PATH)
-    # Most recent 300 bars (then sort ascending for TA-Lib)
-    query = f"""
-        SELECT * FROM trends
-        WHERE symbol = '{symbol}'
-        ORDER BY timestamp DESC
-        LIMIT 300
-    """
-    try:
-        df = con.execute(query).fetchdf()
-        # TA-Lib expects chronological order; we fetched newest-first
-        if len(df) > 0:
-            df = df.iloc[::-1].reset_index(drop=True)
-    except Exception as e:
-        # Handle case where the trends table doesn't exist yet (fresh DB / failed fetch).
-        logger.warning(f"No trends data available for {symbol} (table missing or unreadable): {e}")
-        if connection is None:
-            con.close()
-        return None
-    if connection is None:
-        con.close()
+def _ok(x):
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return False
+    return True
 
+
+def _analyze_df(symbol: str, df: pd.DataFrame, use_staleness_check: bool) -> dict | None:
     if len(df) < 50:
         logger.warning(f"Not enough data for {symbol} (have {len(df)} bars)")
         return None
 
-    # Data quality: skip if latest bar is too old (production only)
-    if connection is None:
+    if use_staleness_check:
         try:
             last_ts = int(df["timestamp"].iloc[-1])
             logger.info(
@@ -53,46 +32,55 @@ def analyze_trends(symbol: str, connection=None) -> dict | None:
                 f"latest timestamp={last_ts}"
             )
             if time.time() - last_ts > STALE_BAR_MINUTES * 60:
-                logger.warning(f"Stale data for {symbol} (latest bar {STALE_BAR_MINUTES}+ min old)")
+                logger.warning(
+                    f"Stale data for {symbol} (latest bar {STALE_BAR_MINUTES}+ min old)"
+                )
                 return None
         except (ValueError, TypeError):
             pass
 
     # Ensure numeric columns
-    for col in ['high', 'low', 'close']:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
+    for col in ["high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
     # Bollinger Bands
     upper, middle, lower = talib.BBANDS(
-        df['close'].values, timeperiod=20, nbdevup=2.0, nbdevdn=2.0, matype=0
+        df["close"].values, timeperiod=20, nbdevup=2.0, nbdevdn=2.0, matype=0
     )
-    df['BB_upper'] = upper
-    df['BB_middle'] = middle
-    df['BB_lower'] = lower
+    df["BB_upper"] = upper
+    df["BB_middle"] = middle
+    df["BB_lower"] = lower
 
     # Parabolic SAR
-    df['SAR'] = talib.SAR(df['high'].values, df['low'].values, acceleration=0.02, maximum=0.20)
+    df["SAR"] = talib.SAR(
+        df["high"].values, df["low"].values, acceleration=0.02, maximum=0.20
+    )
 
     # ADX / DI
-    df['ADX'] = talib.ADX(df['high'].values, df['low'].values, df['close'].values, timeperiod=14)
-    df['+DI'] = talib.PLUS_DI(df['high'].values, df['low'].values, df['close'].values, timeperiod=14)
-    df['-DI'] = talib.MINUS_DI(df['high'].values, df['low'].values, df['close'].values, timeperiod=14)
+    df["ADX"] = talib.ADX(
+        df["high"].values, df["low"].values, df["close"].values, timeperiod=14
+    )
+    df["+DI"] = talib.PLUS_DI(
+        df["high"].values, df["low"].values, df["close"].values, timeperiod=14
+    )
+    df["-DI"] = talib.MINUS_DI(
+        df["high"].values, df["low"].values, df["close"].values, timeperiod=14
+    )
 
     # RSI, MACD, SMA
-    df['RSI_14'] = talib.RSI(df['close'], timeperiod=14)
-    macd, signal, _ = talib.MACD(df['close'], fastperiod=12, slowperiod=26, signalperiod=9)
-    df['MACD'] = macd
-    df['MACD_signal'] = signal
-    df['SMA_50'] = talib.SMA(df['close'], timeperiod=50)
-    df['ATR_14'] = talib.ATR(df['high'].values, df['low'].values, df['close'].values, timeperiod=14)
+    df["RSI_14"] = talib.RSI(df["close"], timeperiod=14)
+    macd, signal, _ = talib.MACD(
+        df["close"], fastperiod=12, slowperiod=26, signalperiod=9
+    )
+    df["MACD"] = macd
+    df["MACD_signal"] = signal
+    df["SMA_50"] = talib.SMA(df["close"], timeperiod=50)
+    df["ATR_14"] = talib.ATR(
+        df["high"].values, df["low"].values, df["close"].values, timeperiod=14
+    )
 
     latest = df.iloc[-1]
     previous = df.iloc[-2] if len(df) >= 2 else None
-
-    def _ok(x):
-        if x is None or (isinstance(x, float) and np.isnan(x)):
-            return False
-        return True
 
     # Trend strength and direction
     adx = latest.get("ADX") if hasattr(latest, "get") else latest["ADX"]
@@ -248,3 +236,45 @@ def analyze_trends(symbol: str, connection=None) -> dict | None:
         "current_price": current_price,
         "atr_14": atr_14_float,
     }
+
+
+def analyze_trends(symbol: str, connection=None) -> dict | None:
+    """
+    Analyze trend signals for a symbol from the trends table (DuckDB / MotherDuck).
+    """
+    con = connection if connection is not None else duckdb.connect(DB_PATH)
+    # Most recent 300 bars (then sort ascending for TA-Lib)
+    query = f"""
+        SELECT * FROM trends
+        WHERE symbol = '{symbol}'
+        ORDER BY timestamp DESC
+        LIMIT 300
+    """
+    try:
+        df = con.execute(query).fetchdf()
+        # TA-Lib expects chronological order; we fetched newest-first
+        if len(df) > 0:
+            df = df.iloc[::-1].reset_index(drop=True)
+    except Exception as e:
+        logger.warning(f"No trends data available for {symbol} (table missing or unreadable): {e}")
+        if connection is None:
+            con.close()
+        return None
+    if connection is None:
+        con.close()
+
+    return _analyze_df(symbol, df, use_staleness_check=True)
+
+
+def analyze_trends_from_providers(symbol: str, lookback_days: int = 365) -> dict | None:
+    """
+    Analyze trend signals using candles fetched directly from providers
+    (yfinance/Finnhub) without relying on the trends table.
+    """
+    df = get_daily_candles_with_failover(symbol, lookback_days=lookback_days)
+    if df is None or len(df) == 0:
+        logger.warning(f"No provider candles available for {symbol}")
+        return None
+    # Ensure chronological order by timestamp
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    return _analyze_df(symbol, df, use_staleness_check=False)
