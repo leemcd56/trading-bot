@@ -1,0 +1,11 @@
+fix: use latest bars for analysis and fix null OHLC from Yahoo fetch
+
+- analysis: load most recent 300 bars (ORDER BY timestamp DESC) then
+  reverse for TA-Lib; previously we loaded the oldest 300, so "latest"
+  bar was ~300 days old and triggered false "stale data" and skip.
+- data_providers: robust Yahoo daily fetch — resolve date/OHLC columns
+  case-insensitively and support MultiIndex; use pd.to_numeric and
+  dropna(close) so we never return all-null OHLC.
+- data_fetch: refuse to store when all close values are null.
+
+Fixes stale-data warnings and empty OHLC in trends table.

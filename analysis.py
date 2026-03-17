@@ -19,14 +19,18 @@ def analyze_trends(symbol: str, connection=None) -> dict | None:
     connection: optional DuckDB connection (e.g. for tests with spoofed data).
     """
     con = connection if connection is not None else duckdb.connect(DB_PATH)
+    # Most recent 300 bars (then sort ascending for TA-Lib)
     query = f"""
         SELECT * FROM trends
         WHERE symbol = '{symbol}'
-        ORDER BY timestamp ASC
+        ORDER BY timestamp DESC
         LIMIT 300
     """
     try:
         df = con.execute(query).fetchdf()
+        # TA-Lib expects chronological order; we fetched newest-first
+        if len(df) > 0:
+            df = df.iloc[::-1].reset_index(drop=True)
     except Exception as e:
         # Handle case where the trends table doesn't exist yet (fresh DB / failed fetch).
         logger.warning(f"No trends data available for {symbol} (table missing or unreadable): {e}")

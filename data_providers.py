@@ -31,6 +31,23 @@ FINNHUB_BASE = "https://finnhub.io/api/v1/stock/candle"
 _finnhub_api_key = os.getenv("FINNHUB_API_KEY")
 
 
+def _col(df: pd.DataFrame, *candidates: str):
+    """Return first existing column from df (case-insensitive). If column is a DataFrame (MultiIndex), take .iloc[:, 0]."""
+    def norm(c):
+        if isinstance(c, tuple):
+            return str(c[0]).lower() if c else ""
+        return str(c).lower()
+    col_map = {norm(c): c for c in df.columns}
+    for name in candidates:
+        key = name.lower()
+        if key in col_map:
+            col = df[col_map[key]]
+            if isinstance(col, pd.DataFrame):
+                col = col.iloc[:, 0]
+            return col
+    return None
+
+
 def _fetch_from_yahoo_daily(symbol: str, start_ts: int, end_ts: int) -> pd.DataFrame | None:
     """
     Fetch daily candles from Yahoo Finance (yfinance).
@@ -45,17 +62,42 @@ def _fetch_from_yahoo_daily(symbol: str, start_ts: int, end_ts: int) -> pd.DataF
             return pd.DataFrame()
         hist = hist.tz_localize("UTC", level=None, nonexistent="shift_forward", ambiguous="NaT") if hist.index.tz is None else hist
         df = hist.reset_index()
-        return pd.DataFrame(
+        # yfinance can use "Date" or "Datetime" for index name; OHLC can be "Open"/"open" etc.
+        date_col = _col(df, "Date", "Datetime", "index")
+        open_col = _col(df, "Open", "open")
+        high_col = _col(df, "High", "high")
+        low_col = _col(df, "Low", "low")
+        close_col = _col(df, "Close", "close")
+        vol_col = _col(df, "Volume", "volume")
+        if date_col is None or close_col is None:
+            logger.warning(f"Yahoo Finance: missing date or close column for {symbol} (columns: {list(df.columns)})")
+            return None
+        if open_col is None:
+            open_col = close_col  # fallback
+        if high_col is None:
+            high_col = close_col
+        if low_col is None:
+            low_col = close_col
+        if vol_col is None:
+            vol_col = pd.Series(0.0, index=df.index)
+        timestamps = pd.to_datetime(date_col, utc=True).astype("int64") // 10**9
+        out = pd.DataFrame(
             {
                 "symbol": symbol,
-                "timestamp": df["Date"].astype("int64") // 10**9,
-                "open": df["Open"],
-                "high": df["High"],
-                "low": df["Low"],
-                "close": df["Close"],
-                "volume": df["Volume"],
+                "timestamp": timestamps,
+                "open": pd.to_numeric(open_col, errors="coerce"),
+                "high": pd.to_numeric(high_col, errors="coerce"),
+                "low": pd.to_numeric(low_col, errors="coerce"),
+                "close": pd.to_numeric(close_col, errors="coerce"),
+                "volume": pd.to_numeric(vol_col, errors="coerce").fillna(0),
             }
         )
+        # Drop rows with no valid close so we never store all-null OHLC
+        out = out.dropna(subset=["close"])
+        if out.empty:
+            logger.warning(f"Yahoo Finance: no valid OHLC for {symbol}")
+            return pd.DataFrame()
+        return out
     except Exception as e:
         logger.warning(f"Yahoo Finance fetch failed for {symbol}: {e}")
         return None
