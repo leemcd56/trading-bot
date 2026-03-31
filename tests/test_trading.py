@@ -94,6 +94,30 @@ def test_all_buy_conditions_submits_buy():
         assert order.side == OrderSide.BUY
 
 
+def test_recent_bullish_signal_can_submit_buy():
+    """A recent bullish confirmation should allow BUY even without same-bar crossover/flip."""
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client:
+        mock_client.get_all_positions.return_value = []
+        analysis = {
+            "strong_trend": True,
+            "uptrend": True,
+            "trending_up_a_lot": True,
+            "near_upper_band": True,
+            "sar_below_price": True,
+            "bullish_crossover": False,
+            "sar_flipped_to_bull": False,
+            "bullish_crossover_recent": True,
+            "sar_flipped_to_bull_recent": False,
+            "similar_to_yesterday": False,
+            "bb_squeeze": False,
+            "avoid_long": False,
+        }
+        trading.execute_trade("TEST", analysis)
+        mock_client.submit_order.assert_called_once()
+        order = mock_client.submit_order.call_args[0][0]
+        assert order.side == OrderSide.BUY
+
+
 def test_sell_condition_submits_sell_when_position_exists():
     """When sell conditions hold and we have a position, submit_order(SELL) should be called."""
     with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client:
