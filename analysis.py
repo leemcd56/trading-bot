@@ -4,13 +4,14 @@ import duckdb
 import pandas as pd
 import talib
 import numpy as np
-from config import DB_PATH
+from config import DB_PATH, NEAR_UPPER_BAND_TOLERANCE, SIMILAR_TO_YESTERDAY_PCT
 from data_providers import get_intraday_price, get_daily_candles_with_failover
 from utils import logger
 
 # Don't trade on data older than this (minutes) when reading from DB.
 # With daily candles, allow up to ~7 days to account for weekends/holidays/provider delays.
 STALE_BAR_MINUTES = 60 * 24 * 7
+RECENT_SIGNAL_LOOKBACK_BARS = 5
 
 
 def _ok(x):
@@ -111,7 +112,7 @@ def _analyze_df(symbol: str, df: pd.DataFrame, use_staleness_check: bool) -> dic
     bb_upper = latest["BB_upper"]
     bb_lower = latest["BB_lower"]
     bb_middle = latest["BB_middle"]
-    near_upper_band = _ok(bb_upper) and close >= float(bb_upper) * 0.995
+    near_upper_band = _ok(bb_upper) and close >= float(bb_upper) * (1 - NEAR_UPPER_BAND_TOLERANCE)
     near_lower_band = _ok(bb_lower) and close <= float(bb_lower) * 1.005
     bb_width_pct = (
         (float(bb_upper) - float(bb_lower)) / float(bb_middle)
@@ -132,6 +133,48 @@ def _analyze_df(symbol: str, df: pd.DataFrame, use_staleness_check: bool) -> dic
             if float(prev_plus) >= float(prev_minus) and float(plus_di) < float(minus_di):
                 bearish_crossover = True
 
+    # Accept recent confirmations (not only exact latest bar) to avoid missing trends
+    bullish_crossover_recent = bullish_crossover
+    sar_flipped_to_bull_recent = sar_flipped_to_bull
+    recent_window = min(RECENT_SIGNAL_LOOKBACK_BARS, len(df) - 1)
+    if recent_window > 1:
+        for i in range(len(df) - recent_window, len(df)):
+            prev = df.iloc[i - 1]
+            curr = df.iloc[i]
+
+            prev_plus = prev["+DI"]
+            prev_minus = prev["-DI"]
+            curr_plus = curr["+DI"]
+            curr_minus = curr["-DI"]
+            if (
+                not bullish_crossover_recent
+                and _ok(prev_plus)
+                and _ok(prev_minus)
+                and _ok(curr_plus)
+                and _ok(curr_minus)
+                and float(prev_plus) <= float(prev_minus)
+                and float(curr_plus) > float(curr_minus)
+            ):
+                bullish_crossover_recent = True
+
+            prev_close = prev["close"]
+            prev_sar = prev["SAR"]
+            curr_close = curr["close"]
+            curr_sar = curr["SAR"]
+            if (
+                not sar_flipped_to_bull_recent
+                and _ok(prev_close)
+                and _ok(prev_sar)
+                and _ok(curr_close)
+                and _ok(curr_sar)
+                and float(prev_close) < float(prev_sar)
+                and float(curr_close) > float(curr_sar)
+            ):
+                sar_flipped_to_bull_recent = True
+
+            if bullish_crossover_recent and sar_flipped_to_bull_recent:
+                break
+
     # Composite: trending up with momentum (AGENTS.md buy condition)
     rsi = latest["RSI_14"]
     macd = latest["MACD"]
@@ -149,13 +192,13 @@ def _analyze_df(symbol: str, df: pd.DataFrame, use_staleness_check: bool) -> dic
         and float(rsi) > 55
     )
 
-    # Similar to yesterday: |change vs prior day close| < 2%
+    # Similar to yesterday: |change vs prior day close| < configurable threshold
     similar_to_yesterday = False
     if len(df) >= 2:
         yesterday_close = df["close"].iloc[-2]
         if _ok(yesterday_close) and float(yesterday_close) != 0:
             pct_change = abs(close - float(yesterday_close)) / float(yesterday_close)
-            similar_to_yesterday = pct_change < 0.02
+            similar_to_yesterday = pct_change < SIMILAR_TO_YESTERDAY_PCT
 
     # Dive bombing: downtrend + RSI < 35 + sharp drop from recent high
     recent_high = float(df["high"].iloc[-10:].max()) if len(df) >= 10 else close
@@ -225,7 +268,9 @@ def _analyze_df(symbol: str, df: pd.DataFrame, use_staleness_check: bool) -> dic
         "near_lower_band": near_lower_band,
         "bb_squeeze": bb_squeeze,
         "bullish_crossover": bullish_crossover,
+        "bullish_crossover_recent": bullish_crossover_recent,
         "bearish_crossover": bearish_crossover,
+        "sar_flipped_to_bull_recent": sar_flipped_to_bull_recent,
         "trending_up_a_lot": trending_up_a_lot,
         "similar_to_yesterday": similar_to_yesterday,
         "dive_bombing": dive_bombing,

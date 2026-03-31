@@ -49,3 +49,11 @@ MAX_SHARES = 100
 # Example: 75 = buy $75 of the symbol per trade (fractional shares). Alpaca minimum is $1.
 # Set to None to use qty-based sizing above.
 NOTIONAL_PER_TRADE = 75
+
+# Entry tuning (conservative, but not overly restrictive)
+# Treat price as "near upper band" when within this fraction below BB upper band.
+# Example: 0.015 = within 1.5% of upper band.
+NEAR_UPPER_BAND_TOLERANCE = 0.015
+# Block entries only when today's move vs yesterday is very small.
+# Example: 0.01 = less than 1% move is considered "similar".
+SIMILAR_TO_YESTERDAY_PCT = 0.01

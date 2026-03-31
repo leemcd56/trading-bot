@@ -307,7 +307,13 @@ def _skip_reasons_buy(analysis: dict) -> list[str]:
         reasons.append("near_upper_band=False")
     if not analysis.get('sar_below_price'):
         reasons.append("sar_below_price=False")
-    if not analysis.get('bullish_crossover') and not analysis.get('sar_flipped_to_bull'):
+    bullish_trigger = (
+        analysis.get('bullish_crossover')
+        or analysis.get('sar_flipped_to_bull')
+        or analysis.get('bullish_crossover_recent')
+        or analysis.get('sar_flipped_to_bull_recent')
+    )
+    if not bullish_trigger:
         reasons.append("no_bullish_crossover_or_sar_flip")
     if analysis.get('similar_to_yesterday'):
         reasons.append("similar_to_yesterday=True")
@@ -323,6 +329,26 @@ def _skip_reasons_buy(analysis: dict) -> list[str]:
             sub.append("volatility_spike")
         reasons.append("avoid_long=" + ",".join(sub) if sub else "avoid_long=True")
     return reasons
+
+
+def _buy_gate_scorecard(analysis: dict) -> str:
+    """Compact pass/fail view of buy gates for quick log scanning."""
+    bullish_trigger = (
+        analysis.get('bullish_crossover')
+        or analysis.get('sar_flipped_to_bull')
+        or analysis.get('bullish_crossover_recent')
+        or analysis.get('sar_flipped_to_bull_recent')
+    )
+    gates = [
+        ("trend", bool(analysis.get('trending_up_a_lot'))),
+        ("upper", bool(analysis.get('near_upper_band'))),
+        ("sar", bool(analysis.get('sar_below_price'))),
+        ("trigger", bool(bullish_trigger)),
+        ("!similar", not bool(analysis.get('similar_to_yesterday', False))),
+        ("!squeeze", not bool(analysis.get('bb_squeeze', False))),
+        ("!avoid", not bool(analysis.get('avoid_long', False))),
+    ]
+    return " ".join([f"{name}={'Y' if ok else 'N'}" for name, ok in gates])
 
 
 def execute_trade(symbol: str, analysis: dict | None):
@@ -398,11 +424,18 @@ def execute_trade(symbol: str, analysis: dict | None):
         if "position does not exist" not in str(e).lower():
             logger.debug(f"No position or error for {symbol}: {e}")
 
+    bullish_trigger = (
+        analysis.get('bullish_crossover')
+        or analysis.get('sar_flipped_to_bull')
+        or analysis.get('bullish_crossover_recent', False)
+        or analysis.get('sar_flipped_to_bull_recent', False)
+    )
+
     if (
         analysis.get('trending_up_a_lot') and
         analysis.get('near_upper_band') and
         analysis.get('sar_below_price') and
-        (analysis.get('bullish_crossover') or analysis.get('sar_flipped_to_bull')) and
+        bullish_trigger and
         not analysis.get('similar_to_yesterday', False) and
         not analysis.get('bb_squeeze', False) and
         not analysis.get('avoid_long', False)
@@ -489,5 +522,6 @@ def execute_trade(symbol: str, analysis: dict | None):
                 logger.error(f"Position check failed for {symbol}: {e}")
     else:
         reasons = _skip_reasons_buy(analysis)
-        logger.info(f"{symbol}: No signal - {', '.join(reasons)}")
-        send_alert(f"{symbol}: No signal — {', '.join(reasons)}", "hodl")
+        scorecard = _buy_gate_scorecard(analysis)
+        logger.info(f"{symbol}: No signal - {scorecard} | {', '.join(reasons)}")
+        send_alert(f"{symbol}: No signal — {scorecard} | {', '.join(reasons)}", "hodl")

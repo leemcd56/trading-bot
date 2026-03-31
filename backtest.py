@@ -181,11 +181,17 @@ def run_backtest(
             if open_count >= MAX_OPEN_POSITIONS:
                 break
 
+            bullish_trigger = (
+                ana.get("bullish_crossover")
+                or ana.get("sar_flipped_to_bull")
+                or ana.get("bullish_crossover_recent", False)
+                or ana.get("sar_flipped_to_bull_recent", False)
+            )
             buy = (
                 ana.get("trending_up_a_lot")
                 and ana.get("near_upper_band")
                 and ana.get("sar_below_price")
-                and (ana.get("bullish_crossover") or ana.get("sar_flipped_to_bull"))
+                and bullish_trigger
                 and not ana.get("similar_to_yesterday", False)
                 and not ana.get("bb_squeeze", False)
                 and not ana.get("avoid_long", False)
