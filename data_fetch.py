@@ -13,7 +13,26 @@ from data_providers import get_daily_candles_with_failover
 def _normalize_timestamps(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     """Coerce timestamp column to epoch seconds and drop invalid rows."""
     out = df.copy()
-    ts_numeric = pd.to_numeric(out["timestamp"], errors="coerce")
+    raw_ts = out["timestamp"]
+    ts_numeric = pd.to_numeric(raw_ts, errors="coerce")
+
+    # Some providers (or pandas coercions) may hand back datetime-like values.
+    # Parse those rows as datetimes, then convert to epoch seconds.
+    if ts_numeric.isna().any():
+        missing_mask = ts_numeric.isna()
+        ts_dt = pd.to_datetime(raw_ts[missing_mask], errors="coerce", utc=True)
+        if not ts_dt.empty:
+            valid_dt_mask = ts_dt.notna()
+            if valid_dt_mask.any():
+                ts_numeric.loc[missing_mask[missing_mask].index[valid_dt_mask]] = (
+                    ts_dt[valid_dt_mask].view("int64") // 10**9
+                )
+
+    # Heuristic: values in nanoseconds (datetime64 int view) should be scaled to seconds.
+    ns_mask = ts_numeric.abs() > 10**12
+    if ns_mask.any():
+        ts_numeric.loc[ns_mask] = (ts_numeric.loc[ns_mask] // 10**9)
+
     out["timestamp"] = ts_numeric.round().astype("Int64")
     before = len(out)
     out = out.dropna(subset=["timestamp"])
