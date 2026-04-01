@@ -32,6 +32,13 @@ def _analyze_df(symbol: str, df: pd.DataFrame, use_staleness_check: bool) -> dic
                 f"{symbol}: analysis dataframe has {len(df)} rows, "
                 f"latest timestamp={last_ts}"
             )
+            if last_ts < 1000000000:
+                logger.warning(
+                    f"{symbol}: invalid latest timestamp={last_ts}. "
+                    "This usually indicates a bad trends table schema; "
+                    "run DB init/migrations to rebuild trends.timestamp as BIGINT."
+                )
+                return None
             if time.time() - last_ts > STALE_BAR_MINUTES * 60:
                 logger.warning(
                     f"Stale data for {symbol} (latest bar {STALE_BAR_MINUTES}+ min old)"
