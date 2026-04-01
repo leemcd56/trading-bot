@@ -2,10 +2,29 @@
 Fetch daily candle data via unified providers and upsert into DuckDB table `trends`.
 """
 import time
+from datetime import datetime, timezone
 import duckdb
+import pandas as pd
 from config import DB_PATH, TRENDS_RETAIN_DAYS
 from utils import logger
 from data_providers import get_daily_candles_with_failover
+
+
+def _normalize_timestamps(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """Coerce timestamp column to epoch seconds and drop invalid rows."""
+    out = df.copy()
+    ts_numeric = pd.to_numeric(out["timestamp"], errors="coerce")
+    out["timestamp"] = ts_numeric.round().astype("Int64")
+    before = len(out)
+    out = out.dropna(subset=["timestamp"])
+    out = out[out["timestamp"] >= 1000000000]
+    dropped = before - len(out)
+    if dropped > 0:
+        logger.warning(
+            f"{symbol}: dropped {dropped} rows with invalid timestamp values before upsert"
+        )
+    out["timestamp"] = out["timestamp"].astype("int64")
+    return out
 
 
 def fetch_and_store(symbol: str) -> None:
@@ -16,6 +35,13 @@ def fetch_and_store(symbol: str) -> None:
     # Require at least one valid close so we never store all-null OHLC
     if df["close"].isna().all():
         logger.warning(f"Refusing to store {symbol}: all close values are null")
+        return
+    if "timestamp" not in df.columns:
+        logger.warning(f"Refusing to store {symbol}: missing timestamp column")
+        return
+    df = _normalize_timestamps(df, symbol)
+    if df.empty:
+        logger.warning(f"Refusing to store {symbol}: no valid timestamps after normalization")
         return
 
     con = duckdb.connect(DB_PATH)
@@ -65,6 +91,11 @@ def fetch_and_store(symbol: str) -> None:
         logger.info(
             f"Fetched and stored {len(df)} bars for {symbol}; "
             f"trends stats: {stats.to_dict(orient='records')}"
+        )
+        latest_ts = int(df["timestamp"].max())
+        latest_utc = datetime.fromtimestamp(latest_ts, tz=timezone.utc).isoformat()
+        logger.info(
+            f"{symbol}: normalized latest timestamp={latest_ts} ({latest_utc})"
         )
     except Exception as e:
         logger.warning(f"Failed to log trends stats after upsert for {symbol}: {e}")
