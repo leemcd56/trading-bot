@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-SYMBOLS = ['AAPL', 'TSLA', 'GOOG', 'MSFT']  # your watchlist
+SYMBOLS = ['AAPL', 'TSLA', 'GOOG', 'MSFT', 'GEHC', 'AAL', 'RUM', 'GE']  # your watchlist
 CHECK_INTERVAL_MINUTES = 60  # with daily candles, checking once per hour is plenty
 
 # Database: force MotherDuck (no local DuckDB fallback)
