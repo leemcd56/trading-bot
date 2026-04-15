@@ -51,6 +51,9 @@ MAX_SHARES = 100
 NOTIONAL_PER_TRADE = 75
 
 # Entry tuning (conservative, but not overly restrictive)
+# Minimum ADX value to consider a trend "strong enough" to trade.
+# 25 is the classic threshold but can miss moderate trends; 20 is a reasonable lower bound.
+ADX_STRONG_TREND_THRESHOLD = 18
 # Treat price as "near upper band" when within this fraction below BB upper band.
 # Example: 0.015 = within 1.5% of upper band.
 NEAR_UPPER_BAND_TOLERANCE = 0.015
