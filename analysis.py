@@ -4,14 +4,14 @@ import duckdb
 import pandas as pd
 import talib
 import numpy as np
-from config import DB_PATH, NEAR_UPPER_BAND_TOLERANCE, SIMILAR_TO_YESTERDAY_PCT
+from config import DB_PATH, NEAR_UPPER_BAND_TOLERANCE, SIMILAR_TO_YESTERDAY_PCT, ADX_STRONG_TREND_THRESHOLD
 from data_providers import get_intraday_price, get_daily_candles_with_failover
 from utils import logger
 
 # Don't trade on data older than this (minutes) when reading from DB.
 # With daily candles, allow up to ~7 days to account for weekends/holidays/provider delays.
 STALE_BAR_MINUTES = 60 * 24 * 7
-RECENT_SIGNAL_LOOKBACK_BARS = 5
+RECENT_SIGNAL_LOOKBACK_BARS = 15
 
 
 def _ok(x):
@@ -94,7 +94,7 @@ def _analyze_df(symbol: str, df: pd.DataFrame, use_staleness_check: bool) -> dic
     adx = latest.get("ADX") if hasattr(latest, "get") else latest["ADX"]
     plus_di = latest["+DI"]
     minus_di = latest["-DI"]
-    strong_trend = _ok(adx) and float(adx) > 25
+    strong_trend = _ok(adx) and float(adx) > ADX_STRONG_TREND_THRESHOLD
     uptrend = _ok(plus_di) and _ok(minus_di) and float(plus_di) > float(minus_di)
 
     # Parabolic SAR vs price
