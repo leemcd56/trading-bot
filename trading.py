@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from utils import logger
 from alerts import send_alert
 from config import (
+    SYMBOLS,
     MAX_DAILY_TRADES,
     MAX_WEEKLY_TRADES,
     MAX_OPEN_POSITIONS,
@@ -241,21 +242,22 @@ def _clear_trail_state(symbol: str) -> None:
 def _open_positions_count() -> int:
     try:
         positions = trading_client.get_all_positions()
-        return sum(1 for p in positions if float(p.qty) > 0)
+        watched = {s.upper() for s in SYMBOLS}
+        return sum(1 for p in positions if p.symbol.upper() in watched and float(p.qty) > 0)
     except Exception as e:
         logger.error(f"Failed to get positions: {e}")
         return 0
 
 
-def _get_account_equity() -> float:
-    """Return current account equity (portfolio value). Returns 0 on error."""
+def _get_account_equity() -> float | None:
+    """Return current account equity (portfolio value). Returns None on error."""
     try:
         account = trading_client.get_account()
         # Alpaca returns equity as string
         return float(account.equity or 0)
     except Exception as e:
         logger.warning(f"Failed to get account equity: {e}")
-        return 0.0
+        return None
 
 
 def _get_buying_power() -> float:
@@ -366,7 +368,7 @@ def execute_trade(symbol: str, analysis: dict | None):
 
     # ─── Stop-loss: sell if position is down STOP_LOSS_PCT from entry ───
     try:
-        position = trading_client.get_position(symbol)
+        position = trading_client.get_open_position(symbol)
         qty = float(position.qty)
         if qty > 0:
             entry = float(position.avg_entry_price)
@@ -387,7 +389,12 @@ def execute_trade(symbol: str, analysis: dict | None):
                     side=OrderSide.SELL,
                     time_in_force=TimeInForce.DAY
                 )
-                trading_client.submit_order(order)
+                try:
+                    trading_client.submit_order(order)
+                except Exception as order_err:
+                    logger.error(f"Stop-loss order submission failed for {symbol}: {order_err}")
+                    send_alert(f"Stop-loss order FAILED for {symbol}: {order_err}", "error")
+                    return
                 _record_trade(symbol, "SELL", qty)
                 _clear_trail_state(symbol)
                 logger.warning(f"Stop-loss SELL for {symbol}: price {current:.2f} <= entry {entry:.2f} * (1 - {STOP_LOSS_PCT:.0%})")
@@ -414,7 +421,12 @@ def execute_trade(symbol: str, analysis: dict | None):
                     side=OrderSide.SELL,
                     time_in_force=TimeInForce.DAY
                 )
-                trading_client.submit_order(order)
+                try:
+                    trading_client.submit_order(order)
+                except Exception as order_err:
+                    logger.error(f"Trailing-stop order submission failed for {symbol}: {order_err}")
+                    send_alert(f"Trailing-stop order FAILED for {symbol}: {order_err}", "error")
+                    return
                 _record_trade(symbol, "SELL", qty)
                 _clear_trail_state(symbol)
                 logger.warning(f"Trailing-stop SELL for {symbol}: price {current:.2f} <= running_high {running_high:.2f} * (1 - {TRAIL_PCT:.0%})")
@@ -422,7 +434,7 @@ def execute_trade(symbol: str, analysis: dict | None):
                 return
     except Exception as e:
         if "position does not exist" not in str(e).lower():
-            logger.debug(f"No position or error for {symbol}: {e}")
+            logger.error(f"Position check failed for {symbol}: {e}")
 
     bullish_trigger = (
         analysis.get('bullish_crossover')
@@ -455,7 +467,12 @@ def execute_trade(symbol: str, analysis: dict | None):
                     side=OrderSide.BUY,
                     time_in_force=TimeInForce.DAY
                 )
-                trading_client.submit_order(order)
+                try:
+                    trading_client.submit_order(order)
+                except Exception as order_err:
+                    logger.error(f"BUY order submission failed for {symbol}: {order_err}")
+                    send_alert(f"BUY order FAILED for {symbol}: {order_err}", "error")
+                    return
                 _record_trade(symbol, "BUY", 1)
                 logger.info(f"BUY submitted for {symbol} qty=1 (whole share, price ${price:.2f} <= ${NOTIONAL_PER_TRADE})")
                 send_alert(f"BUY {symbol} 1 share @ ~${price:.2f}", "trade")
@@ -471,12 +488,20 @@ def execute_trade(symbol: str, analysis: dict | None):
                     side=OrderSide.BUY,
                     time_in_force=TimeInForce.DAY
                 )
-                trading_client.submit_order(order)
+                try:
+                    trading_client.submit_order(order)
+                except Exception as order_err:
+                    logger.error(f"BUY order submission failed for {symbol}: {order_err}")
+                    send_alert(f"BUY order FAILED for {symbol}: {order_err}", "error")
+                    return
                 _record_trade(symbol, "BUY", 0)
                 logger.info(f"BUY submitted for {symbol} notional=${notional:.2f}")
                 send_alert(f"BUY {symbol} ${notional:.2f}", "trade")
         else:
             equity = _get_account_equity()
+            if equity is None:
+                logger.warning(f"{symbol}: Skipping BUY - could not fetch account equity")
+                return
             qty = _compute_buy_qty(analysis, equity) if equity > 0 else MIN_SHARES
             order = MarketOrderRequest(
                 symbol=symbol,
@@ -484,7 +509,12 @@ def execute_trade(symbol: str, analysis: dict | None):
                 side=OrderSide.BUY,
                 time_in_force=TimeInForce.DAY
             )
-            trading_client.submit_order(order)
+            try:
+                trading_client.submit_order(order)
+            except Exception as order_err:
+                logger.error(f"BUY order submission failed for {symbol}: {order_err}")
+                send_alert(f"BUY order FAILED for {symbol}: {order_err}", "error")
+                return
             _record_trade(symbol, "BUY", qty)
             logger.info(f"BUY submitted for {symbol} qty={qty}")
             send_alert(f"BUY {symbol} qty={qty}", "trade")
@@ -497,29 +527,35 @@ def execute_trade(symbol: str, analysis: dict | None):
         analysis.get('bearish_crossover')
     ):
         try:
-            position = trading_client.get_position(symbol)
+            position = trading_client.get_open_position(symbol)
             qty = float(position.qty)
-            if qty > 0:
-                if _should_block_sell_pdt(symbol):
-                    logger.warning(
-                        f"{symbol}: Skipping signal SELL - PDT limit reached ({_count_day_trades_in_last_5_days()}/{MAX_DAY_TRADES_IN_5_DAYS} day trades in 5 days)"
-                    )
-                    send_alert(f"{symbol}: Signal SELL skipped (PDT limit). Consider closing tomorrow.", "error")
-                else:
-                    order = MarketOrderRequest(
-                        symbol=symbol,
-                        qty=qty,
-                        side=OrderSide.SELL,
-                        time_in_force=TimeInForce.DAY
-                    )
-                    trading_client.submit_order(order)
-                    _record_trade(symbol, "SELL", qty)
-                    _clear_trail_state(symbol)
-                    logger.info(f"SELL submitted for {symbol}")
-                    send_alert(f"SELL {symbol} qty={qty:.4g}", "trade")
         except Exception as e:
             if "position does not exist" not in str(e).lower():
                 logger.error(f"Position check failed for {symbol}: {e}")
+            qty = 0
+        if qty > 0:
+            if _should_block_sell_pdt(symbol):
+                logger.warning(
+                    f"{symbol}: Skipping signal SELL - PDT limit reached ({_count_day_trades_in_last_5_days()}/{MAX_DAY_TRADES_IN_5_DAYS} day trades in 5 days)"
+                )
+                send_alert(f"{symbol}: Signal SELL skipped (PDT limit). Consider closing tomorrow.", "error")
+            else:
+                order = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=qty,
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY
+                )
+                try:
+                    trading_client.submit_order(order)
+                except Exception as order_err:
+                    logger.error(f"SELL order submission failed for {symbol}: {order_err}")
+                    send_alert(f"SELL order FAILED for {symbol}: {order_err}", "error")
+                    return
+                _record_trade(symbol, "SELL", qty)
+                _clear_trail_state(symbol)
+                logger.info(f"SELL submitted for {symbol}")
+                send_alert(f"SELL {symbol} qty={qty:.4g}", "trade")
     else:
         reasons = _skip_reasons_buy(analysis)
         scorecard = _buy_gate_scorecard(analysis)
