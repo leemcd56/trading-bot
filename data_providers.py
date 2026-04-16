@@ -94,7 +94,10 @@ def _fetch_from_yahoo_daily(symbol: str, start_ts: int, end_ts: int) -> pd.DataF
         df = hist.copy()
         # Align index-based timestamps with df rows
         df = df.iloc[: len(idx)]
-        timestamps = idx.astype("int64") // 10**9
+        # Use epoch subtraction so the result is always epoch seconds regardless
+        # of the DatetimeIndex's internal resolution (ns vs s in pandas 2.x).
+        _epoch = pd.Timestamp("1970-01-01", tz="UTC")
+        timestamps = ((idx - _epoch).total_seconds()).astype("int64")
 
         open_col = _col(df, "Open", "open")
         high_col = _col(df, "High", "high")
