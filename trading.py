@@ -305,8 +305,6 @@ def _skip_reasons_buy(analysis: dict) -> list[str]:
     reasons = []
     if not analysis.get('trending_up_a_lot'):
         reasons.append("trending_up_a_lot=False")
-    if not analysis.get('near_upper_band'):
-        reasons.append("near_upper_band=False")
     if not analysis.get('sar_below_price'):
         reasons.append("sar_below_price=False")
     bullish_trigger = (
@@ -343,7 +341,6 @@ def _buy_gate_scorecard(analysis: dict) -> str:
     )
     gates = [
         ("trend", bool(analysis.get('trending_up_a_lot'))),
-        ("upper", bool(analysis.get('near_upper_band'))),
         ("sar", bool(analysis.get('sar_below_price'))),
         ("trigger", bool(bullish_trigger)),
         ("!similar", not bool(analysis.get('similar_to_yesterday', False))),
@@ -445,7 +442,6 @@ def execute_trade(symbol: str, analysis: dict | None):
 
     if (
         analysis.get('trending_up_a_lot') and
-        analysis.get('near_upper_band') and
         analysis.get('sar_below_price') and
         bullish_trigger and
         not analysis.get('similar_to_yesterday', False) and

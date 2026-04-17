@@ -196,7 +196,7 @@ def _analyze_df(symbol: str, df: pd.DataFrame, use_staleness_check: bool) -> dic
         and _ok(macd_sig)
         and float(macd) > float(macd_sig)
         and _ok(rsi)
-        and float(rsi) > 55
+        and float(rsi) > 50
     )
 
     # Similar to yesterday: |change vs prior day close| < configurable threshold

@@ -3,7 +3,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-SYMBOLS = ['AAPL', 'TSLA', 'GOOG', 'MSFT', 'GEHC', 'AAL', 'RUM', 'GE']  # your watchlist
+_symbols_env = os.getenv("WATCH_SYMBOLS", "")
+SYMBOLS = (
+    [s.strip().upper() for s in _symbols_env.split(",") if s.strip()]
+    if _symbols_env.strip()
+    else ["AAPL", "TSLA", "GOOG", "MSFT"]
+)
 CHECK_INTERVAL_MINUTES = 60  # with daily candles, checking once per hour is plenty
 
 # Database: force MotherDuck (no local DuckDB fallback)
@@ -56,7 +61,7 @@ NOTIONAL_PER_TRADE = 75
 ADX_STRONG_TREND_THRESHOLD = 18
 # Treat price as "near upper band" when within this fraction below BB upper band.
 # Example: 0.015 = within 1.5% of upper band.
-NEAR_UPPER_BAND_TOLERANCE = 0.015
+NEAR_UPPER_BAND_TOLERANCE = 0.025
 # Block entries only when today's move vs yesterday is very small.
 # Example: 0.01 = less than 1% move is considered "similar".
 SIMILAR_TO_YESTERDAY_PCT = 0.01

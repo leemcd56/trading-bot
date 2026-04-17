@@ -2,13 +2,15 @@
 Helpers for tests: build spoofed OHLC data and load it into a DuckDB connection.
 Use 1-min bars; analysis needs at least 50 bars and uses up to 300.
 """
+import time
 import duckdb
 import pandas as pd
 import numpy as np
 
 # ~300 1-min bars (analysis LIMIT 300); need 50+ for indicators
 NUM_BARS = 300
-BASE_TS = 1700000000  # Unix base for deterministic timestamps
+# Anchor timestamps to now so the staleness check (7-day window) always passes
+BASE_TS = int(time.time()) - NUM_BARS * 60
 
 
 def make_ohlc(
