@@ -2,8 +2,9 @@ import time
 import schedule
 from data_fetch import fetch_and_store, prune_old_trends
 from analysis import analyze_trends
-from trading import execute_trade, prune_old_trade_log
+from trading import execute_trade, execute_signal_buy, execute_signal_sell, prune_old_trade_log
 from migrations import init_db
+from signals import fetch_signals
 from utils import logger, is_market_open
 from alerts import send_alert
 from config import SYMBOLS, CHECK_INTERVAL_MINUTES
@@ -12,6 +13,27 @@ def job():
     if not is_market_open():
         logger.info("Market closed - skipping")
         return
+
+    # ── External signal trades (analyst upgrades/downgrades, no TA required) ──
+    try:
+        signals = fetch_signals()
+        for symbol in signals.get("buy", []):
+            try:
+                execute_signal_buy(symbol)
+            except Exception as e:
+                logger.error(f"Error on signal buy for {symbol}: {e}")
+                send_alert(f"Error on signal buy for {symbol}: {e}", "error")
+        for symbol in signals.get("sell", []):
+            try:
+                execute_signal_sell(symbol)
+            except Exception as e:
+                logger.error(f"Error on signal sell for {symbol}: {e}")
+                send_alert(f"Error on signal sell for {symbol}: {e}", "error")
+    except Exception as e:
+        logger.error(f"Signal fetch failed: {e}")
+        send_alert(f"Signal fetch failed: {e}", "error")
+
+    # ── TA-based trades (existing technical analysis loop) ──
     for symbol in SYMBOLS:
         try:
             fetch_and_store(symbol)

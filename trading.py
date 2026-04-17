@@ -9,6 +9,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 from dotenv import load_dotenv
 from utils import logger
 from alerts import send_alert
+from data_providers import get_intraday_price
 from config import (
     SYMBOLS,
     MAX_DAILY_TRADES,
@@ -557,3 +558,143 @@ def execute_trade(symbol: str, analysis: dict | None):
         scorecard = _buy_gate_scorecard(analysis)
         logger.info(f"{symbol}: No signal - {scorecard} | {', '.join(reasons)}")
         send_alert(f"{symbol}: No signal — {scorecard} | {', '.join(reasons)}", "hodl")
+
+
+# ─── Signal-based execution (external oracle, bypasses TA gates) ───────────────
+
+
+def execute_signal_buy(symbol: str) -> None:
+    """
+    Buy symbol based on an external signal. Skips all TA gates but still
+    respects daily/weekly trade caps, open-position limit, and notional sizing.
+    """
+    if _count_daily() >= MAX_DAILY_TRADES:
+        logger.warning(f"{symbol} [signal]: Skipping BUY - daily cap ({_count_daily()}/{MAX_DAILY_TRADES})")
+        return
+    if _count_weekly() >= MAX_WEEKLY_TRADES:
+        logger.warning(f"{symbol} [signal]: Skipping BUY - weekly cap ({_count_weekly()}/{MAX_WEEKLY_TRADES})")
+        return
+    if _open_positions_count() >= MAX_OPEN_POSITIONS:
+        logger.warning(f"{symbol} [signal]: Skipping BUY - max open positions ({MAX_OPEN_POSITIONS})")
+        return
+
+    # Don't double-buy a symbol we're already holding.
+    try:
+        position = trading_client.get_open_position(symbol)
+        if float(position.qty) > 0:
+            logger.info(f"{symbol} [signal]: Already holding, skipping BUY")
+            return
+    except Exception as e:
+        if "position does not exist" not in str(e).lower():
+            logger.error(f"{symbol} [signal]: Position check failed: {e}")
+
+    buying_power = _get_buying_power()
+
+    if NOTIONAL_PER_TRADE is not None and NOTIONAL_PER_TRADE >= 1:
+        price = get_intraday_price(symbol)
+        if price and price > 0 and price <= NOTIONAL_PER_TRADE and buying_power >= price:
+            # Whole share when it fits inside our notional target.
+            order = MarketOrderRequest(
+                symbol=symbol, qty=1, side=OrderSide.BUY, time_in_force=TimeInForce.DAY
+            )
+            try:
+                trading_client.submit_order(order)
+            except Exception as order_err:
+                logger.error(f"{symbol} [signal]: BUY order failed: {order_err}")
+                send_alert(f"[signal] BUY order FAILED for {symbol}: {order_err}", "error")
+                return
+            _record_trade(symbol, "BUY", 1)
+            logger.info(f"{symbol} [signal]: BUY submitted qty=1 (whole share @ ~${price:.2f})")
+            send_alert(f"[signal] BUY {symbol} 1 share @ ~${price:.2f}", "trade")
+        else:
+            notional = min(float(NOTIONAL_PER_TRADE), buying_power) if buying_power > 0 else 0.0
+            if notional < 1:
+                logger.warning(f"{symbol} [signal]: Skipping BUY - notional ${notional:.2f} below Alpaca minimum $1")
+                return
+            notional = round(notional, 2)
+            order = MarketOrderRequest(
+                symbol=symbol, notional=notional, side=OrderSide.BUY, time_in_force=TimeInForce.DAY
+            )
+            try:
+                trading_client.submit_order(order)
+            except Exception as order_err:
+                logger.error(f"{symbol} [signal]: BUY order failed: {order_err}")
+                send_alert(f"[signal] BUY order FAILED for {symbol}: {order_err}", "error")
+                return
+            _record_trade(symbol, "BUY", 0)
+            logger.info(f"{symbol} [signal]: BUY submitted notional=${notional:.2f}")
+            send_alert(f"[signal] BUY {symbol} ${notional:.2f}", "trade")
+    else:
+        # Qty mode (no notional configured): buy 1 share.
+        order = MarketOrderRequest(
+            symbol=symbol, qty=1, side=OrderSide.BUY, time_in_force=TimeInForce.DAY
+        )
+        try:
+            trading_client.submit_order(order)
+        except Exception as order_err:
+            logger.error(f"{symbol} [signal]: BUY order failed: {order_err}")
+            send_alert(f"[signal] BUY order FAILED for {symbol}: {order_err}", "error")
+            return
+        _record_trade(symbol, "BUY", 1)
+        logger.info(f"{symbol} [signal]: BUY submitted qty=1")
+        send_alert(f"[signal] BUY {symbol} qty=1", "trade")
+
+
+def execute_signal_sell(symbol: str) -> None:
+    """
+    Sell symbol based on an external signal.
+    Requires the position to have been held for at least 24 hours so we
+    never flip a same-day buy into a day trade from a signal change.
+    """
+    # 24-hour minimum hold: look up the most recent BUY in the trade log.
+    con = duckdb.connect(DB_PATH)
+    try:
+        _ensure_trade_log(con)
+        out = con.execute(
+            f"SELECT MAX(timestamp_utc) FROM {TRADE_LOG_TABLE} WHERE symbol = ? AND side = 'BUY'",
+            [symbol],
+        ).fetchone()
+        last_buy_ts = float(out[0]) if out and out[0] is not None else None
+    finally:
+        con.close()
+
+    if last_buy_ts is None:
+        logger.info(f"{symbol} [signal]: No buy record found, skipping signal SELL")
+        return
+
+    held_seconds = time.time() - last_buy_ts
+    if held_seconds < 86400:
+        logger.info(
+            f"{symbol} [signal]: Skipping SELL - held only {held_seconds / 3600:.1f}h (need 24h)"
+        )
+        return
+
+    if _should_block_sell_pdt(symbol):
+        logger.warning(f"{symbol} [signal]: Skipping SELL - PDT limit reached")
+        send_alert(f"{symbol}: [signal] SELL skipped (PDT limit).", "error")
+        return
+
+    try:
+        position = trading_client.get_open_position(symbol)
+        qty = float(position.qty)
+    except Exception as e:
+        if "position does not exist" not in str(e).lower():
+            logger.error(f"{symbol} [signal]: Position check failed: {e}")
+        return
+
+    if qty <= 0:
+        return
+
+    order = MarketOrderRequest(
+        symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY
+    )
+    try:
+        trading_client.submit_order(order)
+    except Exception as order_err:
+        logger.error(f"{symbol} [signal]: SELL order failed: {order_err}")
+        send_alert(f"[signal] SELL order FAILED for {symbol}: {order_err}", "error")
+        return
+    _record_trade(symbol, "SELL", qty)
+    _clear_trail_state(symbol)
+    logger.info(f"{symbol} [signal]: SELL submitted qty={qty:.4g}")
+    send_alert(f"[signal] SELL {symbol} qty={qty:.4g}", "trade")
