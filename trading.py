@@ -31,6 +31,12 @@ from config import (
 load_dotenv()
 
 _base_url = os.getenv("ALPACA_BASE_URL")
+# Strip trailing /v2 — the SDK appends it internally, so including it in
+# url_override results in double /v2 paths (e.g. /v2/v2/account → 404).
+if _base_url:
+    _base_url = _base_url.rstrip("/")
+    if _base_url.endswith("/v2"):
+        _base_url = _base_url[:-3]
 trading_client = TradingClient(
     api_key=os.getenv('ALPACA_API_KEY'),
     secret_key=os.getenv('ALPACA_SECRET_KEY'),
@@ -431,7 +437,7 @@ def execute_trade(symbol: str, analysis: dict | None):
                 send_alert(f"Trailing-stop SELL {symbol} qty={qty:.4g} @ {current:.2f} (running_high {running_high:.2f})", "trade")
                 return
     except Exception as e:
-        if "position does not exist" not in str(e).lower():
+        if "position does not exist" not in str(e).lower() and "not found" not in str(e).lower():
             logger.error(f"Position check failed for {symbol}: {e}")
 
     bullish_trigger = (
@@ -527,7 +533,7 @@ def execute_trade(symbol: str, analysis: dict | None):
             position = trading_client.get_open_position(symbol)
             qty = float(position.qty)
         except Exception as e:
-            if "position does not exist" not in str(e).lower():
+            if "position does not exist" not in str(e).lower() and "not found" not in str(e).lower():
                 logger.error(f"Position check failed for {symbol}: {e}")
             qty = 0
         if qty > 0:
@@ -585,7 +591,7 @@ def execute_signal_buy(symbol: str) -> None:
             logger.info(f"{symbol} [signal]: Already holding, skipping BUY")
             return
     except Exception as e:
-        if "position does not exist" not in str(e).lower():
+        if "position does not exist" not in str(e).lower() and "not found" not in str(e).lower():
             logger.error(f"{symbol} [signal]: Position check failed: {e}")
 
     buying_power = _get_buying_power()
@@ -678,7 +684,7 @@ def execute_signal_sell(symbol: str) -> None:
         position = trading_client.get_open_position(symbol)
         qty = float(position.qty)
     except Exception as e:
-        if "position does not exist" not in str(e).lower():
+        if "position does not exist" not in str(e).lower() and "not found" not in str(e).lower():
             logger.error(f"{symbol} [signal]: Position check failed: {e}")
         return
 
