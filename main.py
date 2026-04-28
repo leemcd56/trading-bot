@@ -7,14 +7,18 @@ from migrations import init_db
 from signals import fetch_signals
 from utils import logger, is_market_open
 from alerts import send_alert
-from config import SYMBOLS, CHECK_INTERVAL_MINUTES
+from config import SYMBOLS, CHECK_INTERVAL_MINUTES, FMP_CHECK_INTERVAL_MINUTES
 
-def job():
+
+def fmp_job():
+    """
+    Independent FMP signal job — runs on its own schedule, separate from the TA loop.
+    When analyst upgrades/downgrades warrant a trade, this fires it immediately without
+    waiting for the next TA tick, but still respects all safety limits (daily cap,
+    weekly cap, open-position cap, notional sizing, PDT guard).
+    """
     if not is_market_open():
-        logger.info("Market closed - skipping")
         return
-
-    # ── External signal trades (analyst upgrades/downgrades, no TA required) ──
     try:
         signals = fetch_signals()
         for symbol in signals.get("buy", []):
@@ -33,7 +37,12 @@ def job():
         logger.error(f"Signal fetch failed: {e}")
         send_alert(f"Signal fetch failed: {e}", "error")
 
-    # ── TA-based trades (existing technical analysis loop) ──
+
+def ta_job():
+    """TA-based trading loop over WATCH_SYMBOLS."""
+    if not is_market_open():
+        logger.info("Market closed - skipping")
+        return
     for symbol in SYMBOLS:
         try:
             fetch_and_store(symbol)
@@ -58,11 +67,13 @@ if __name__ == "__main__":
         send_alert(f"Database initialization failed: {e}", "error")
         raise
 
-    schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(job)
+    schedule.every(FMP_CHECK_INTERVAL_MINUTES).minutes.do(fmp_job)
+    schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(ta_job)
 
     logger.info("Trading bot started...")
-    # Run first cycle immediately so we see activity right away (e.g. in Railway logs).
-    job()
+    # Run both jobs immediately so we see activity right away (e.g. in Railway logs).
+    fmp_job()
+    ta_job()
 
     while True:
         schedule.run_pending()
