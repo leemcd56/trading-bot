@@ -9,7 +9,8 @@ SYMBOLS = (
     if _symbols_env.strip()
     else ["AAPL", "TSLA", "GOOG", "MSFT"]
 )
-CHECK_INTERVAL_MINUTES = 60  # with daily candles, checking once per hour is plenty
+CHECK_INTERVAL_MINUTES = 60          # TA loop: once per hour is plenty with daily candles
+FMP_CHECK_INTERVAL_MINUTES = 30     # FMP signal check: every 30 min to catch intraday analyst actions early
 
 # Database: force MotherDuck (no local DuckDB fallback)
 _motherduck_token = os.getenv("MOTHERDUCK_TOKEN")
