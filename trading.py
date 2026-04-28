@@ -249,8 +249,7 @@ def _clear_trail_state(symbol: str) -> None:
 def _open_positions_count() -> int:
     try:
         positions = trading_client.get_all_positions()
-        watched = {s.upper() for s in SYMBOLS}
-        return sum(1 for p in positions if p.symbol.upper() in watched and float(p.qty) > 0)
+        return sum(1 for p in positions if float(p.qty) > 0)
     except Exception as e:
         logger.error(f"Failed to get positions: {e}")
         return 0
