@@ -18,7 +18,7 @@ import requests
 from utils import logger
 
 FMP_API_KEY = os.getenv("FMP_API_KEY", "")
-_FMP_URL = "https://financialmodelingprep.com/api/v3/upgrades-downgrades"
+_FMP_URL = "https://financialmodelingprep.com/stable/upgrades-downgrades"
 
 # Grade strings that count as a buy or sell signal (case-insensitive substring match).
 _BUY_GRADES = {"buy", "strong buy", "outperform", "overweight", "accumulate", "conviction buy", "market outperform"}
@@ -44,7 +44,11 @@ def fetch_signals() -> dict:
 
     today = date.today().isoformat()
     try:
-        resp = requests.get(_FMP_URL, params={"apikey": FMP_API_KEY}, timeout=15)
+        resp = requests.get(
+            _FMP_URL,
+            params={"apikey": FMP_API_KEY, "date": today},
+            timeout=15,
+        )
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
@@ -60,7 +64,8 @@ def fetch_signals() -> dict:
     seen: set[str] = set()
 
     for entry in data:
-        published = (entry.get("publishedDate") or "")[:10]
+        # stable endpoint uses "date"; fall back to "publishedDate" for safety
+        published = (entry.get("date") or entry.get("publishedDate") or "")[:10]
         if published != today:
             continue
 
@@ -69,7 +74,8 @@ def fetch_signals() -> dict:
             continue
 
         action = (entry.get("action") or "").lower().strip()
-        new_grade = entry.get("newGrade") or ""
+        # stable endpoint uses "newGrade"; fall back to "newGrade" (same key, kept for clarity)
+        new_grade = entry.get("newGrade") or entry.get("newRating") or ""
 
         if action in _BUY_ACTIONS and _grade_is(new_grade, _BUY_GRADES):
             buy.append(symbol)
