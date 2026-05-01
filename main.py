@@ -70,7 +70,7 @@ if __name__ == "__main__":
     schedule.every(FMP_CHECK_INTERVAL_MINUTES).minutes.do(fmp_job)
     schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(ta_job)
 
-    logger.info("Trading bot started...")
+    logger.info(f"Trading bot started. Watching symbols: {SYMBOLS}")
     # Run both jobs immediately so we see activity right away (e.g. in Railway logs).
     fmp_job()
     ta_job()
