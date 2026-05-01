@@ -27,8 +27,8 @@ TRENDS_RETAIN_DAYS = 365      # keep this many days of daily candles per symbol
 TRADE_LOG_RETAIN_DAYS = 30    # keep this many days of trade log (for daily/weekly counts we need 7+)
 
 # Risk limits (no new orders when at cap)
-MAX_DAILY_TRADES = 3   # max new orders per calendar day
-MAX_WEEKLY_TRADES = 8  # max new orders in rolling 7 calendar days
+MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "3"))    # max new orders per calendar day
+MAX_WEEKLY_TRADES = int(os.getenv("MAX_WEEKLY_TRADES", "8"))  # max new orders in rolling 7 calendar days
 MAX_OPEN_POSITIONS = 4  # max symbols held at once (across SYMBOLS)
 
 # Stop-loss: sell if position is down this much from average entry (e.g. 0.05 = 5%)
