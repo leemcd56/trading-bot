@@ -19,6 +19,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
+RUN chmod +x start.sh
 
-# Persist DB and logs via volume mount; .env provided at runtime (env_file or -e).
-CMD ["python", "main.py"]
+# start.sh runs the trading bot in the background and the dashboard web server
+# in the foreground. Railway injects $PORT; uvicorn binds to it automatically.
+CMD ["./start.sh"]
