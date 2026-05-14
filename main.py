@@ -1,5 +1,7 @@
 import time
+import datetime
 import schedule
+import pytz
 from data_fetch import fetch_and_store, prune_old_trends
 from analysis import analyze_trends
 from trading import execute_trade, execute_signal_buy, execute_signal_sell, prune_old_trade_log
@@ -7,7 +9,10 @@ from migrations import init_db
 from signals import fetch_signals
 from utils import logger, is_market_open
 from alerts import send_alert
+from report import snapshot_portfolio, send_eod_summary
 from config import SYMBOLS, CHECK_INTERVAL_MINUTES, FMP_CHECK_INTERVAL_MINUTES
+
+_ET = pytz.timezone("US/Eastern")
 
 
 def fmp_job():
@@ -43,20 +48,50 @@ def ta_job():
     if not is_market_open():
         logger.info("Market closed - skipping")
         return
+    no_signal = []
     for symbol in SYMBOLS:
         try:
             fetch_and_store(symbol)
             analysis = analyze_trends(symbol)
-            execute_trade(symbol, analysis)
+            result = execute_trade(symbol, analysis)
+            if result:
+                no_signal.append(result)
         except Exception as e:
             logger.error(f"Error processing {symbol}: {e}")
             send_alert(f"Error processing {symbol}: {e}", "error")
+    if no_signal:
+        lines = "\n".join(f"• {s}" for s in no_signal)
+        send_alert(f"No signal this cycle:\n{lines}", "hodl")
     try:
         prune_old_trends()
         prune_old_trade_log()
     except Exception as e:
         logger.warning(f"Prune failed: {e}")
         send_alert(f"Prune failed: {e}", "error")
+
+def open_snapshot_job():
+    """Capture market-open portfolio equity once per trading day."""
+    if not is_market_open():
+        return
+    equity = snapshot_portfolio("open")
+    if equity is not None:
+        logger.info(f"Market-open snapshot: ${equity:,.2f}")
+
+
+def eod_job():
+    """After market close, capture closing equity and send the daily Discord summary (once per day)."""
+    now_et = datetime.datetime.now(_ET)
+    if now_et.weekday() >= 5 or now_et.hour < 16:
+        return
+    equity = snapshot_portfolio("close")
+    if equity is not None:
+        logger.info(f"Market-close snapshot: ${equity:,.2f}")
+        try:
+            send_eod_summary()
+        except Exception as e:
+            logger.error(f"EOD summary failed: {e}")
+            send_alert(f"EOD summary failed: {e}", "error")
+
 
 if __name__ == "__main__":
     # Initialize database schema up front so tables exist before first run.
@@ -69,6 +104,8 @@ if __name__ == "__main__":
 
     schedule.every(FMP_CHECK_INTERVAL_MINUTES).minutes.do(fmp_job)
     schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(ta_job)
+    schedule.every(15).minutes.do(open_snapshot_job)
+    schedule.every(15).minutes.do(eod_job)
 
     logger.info(f"Trading bot started. Watching symbols: {SYMBOLS}")
     # Run both jobs immediately so we see activity right away (e.g. in Railway logs).

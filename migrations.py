@@ -7,7 +7,7 @@ doesn't rely on lazy creation inside other modules.
 import duckdb
 from config import DB_PATH
 from utils import logger
-from trading import TRADE_LOG_TABLE, TRAIL_STATE_TABLE
+from trading import TRADE_LOG_TABLE, TRAIL_STATE_TABLE, TRADE_HISTORY_TABLE
 
 
 def _ensure_trends_schema(con: duckdb.DuckDBPyConnection) -> None:
@@ -121,6 +121,32 @@ def init_db() -> None:
                 symbol VARCHAR PRIMARY KEY,
                 running_high DOUBLE,
                 updated_at DOUBLE
+            )
+            """
+        )
+
+        # Human-readable trade history with price (for EOD reporting)
+        con.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {TRADE_HISTORY_TABLE} (
+                timestamp_utc DOUBLE,
+                symbol VARCHAR,
+                side VARCHAR,
+                qty DOUBLE,
+                price DOUBLE,
+                source VARCHAR
+            )
+            """
+        )
+
+        # Portfolio equity snapshots at market open and close
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+                timestamp_utc DOUBLE,
+                date_et VARCHAR,
+                label VARCHAR,
+                equity DOUBLE
             )
             """
         )
