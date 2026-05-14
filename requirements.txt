@@ -10,3 +10,5 @@ pytz
 pytest
 massive
 yfinance
+fastapi
+uvicorn[standard]

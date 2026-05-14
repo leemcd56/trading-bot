@@ -1,0 +1,694 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Trading Bot · Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600&family=Syne:wght@500;600;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg:            #0d1117;
+      --surface:       #161b22;
+      --surface-2:     #1c2128;
+      --surface-hover: #21262d;
+      --border:        #30363d;
+      --border-subtle: #1c2128;
+      --text:          #e6edf3;
+      --muted:         #7d8590;
+      --muted-2:       #484f58;
+      --green:         #3fb950;
+      --green-dim:     rgba(63, 185, 80, 0.12);
+      --green-border:  rgba(63, 185, 80, 0.28);
+      --red:           #f85149;
+      --red-dim:       rgba(248, 81, 73, 0.12);
+      --red-border:    rgba(248, 81, 73, 0.28);
+      --blue:          #58a6ff;
+      --yellow:        #d29922;
+      --mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+      --sans: 'Syne', system-ui, sans-serif;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(33, 38, 45, 0.4) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(33, 38, 45, 0.4) 1px, transparent 1px);
+      background-size: 44px 44px;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* ─── HEADER ──────────────────────────────────────────────── */
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: rgba(13, 17, 23, 0.85);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      border-bottom: 1px solid var(--border);
+      padding: 0 28px;
+      height: 54px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .h-left {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .logo {
+      font-family: var(--sans);
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--text);
+      letter-spacing: -0.02em;
+    }
+
+    .live-pill {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 8px 2px 6px;
+      border-radius: 20px;
+      background: var(--green-dim);
+      border: 1px solid var(--green-border);
+      font-size: 10px;
+      font-weight: 600;
+      color: var(--green);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .live-dot {
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: var(--green);
+      animation: blink 2s ease-in-out infinite;
+    }
+
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.3; }
+    }
+
+    #lastUpdated {
+      font-size: 11px;
+      color: var(--muted);
+      letter-spacing: 0.02em;
+    }
+
+    /* ─── MAIN ────────────────────────────────────────────────── */
+    main {
+      position: relative;
+      z-index: 1;
+      max-width: 1440px;
+      margin: 0 auto;
+      padding: 28px 28px 56px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    /* ─── CARD BASE ───────────────────────────────────────────── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px 22px;
+      position: relative;
+      animation: rise 0.45s ease both;
+    }
+
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(10px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .card-label {
+      font-size: 10px;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--muted-2);
+      margin-bottom: 10px;
+    }
+
+    /* ─── STAT CARDS ──────────────────────────────────────────── */
+    .stats-row {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 14px;
+    }
+
+    .stats-row .card:nth-child(1) { animation-delay: 0.04s; }
+    .stats-row .card:nth-child(2) { animation-delay: 0.08s; }
+    .stats-row .card:nth-child(3) { animation-delay: 0.12s; }
+    .stats-row .card:nth-child(4) { animation-delay: 0.16s; }
+
+    .stat-value {
+      font-size: 27px;
+      font-weight: 600;
+      color: var(--text);
+      letter-spacing: -0.025em;
+      font-variant-numeric: tabular-nums;
+      line-height: 1;
+      margin-bottom: 8px;
+    }
+
+    .stat-sub {
+      font-size: 12px;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .pos  { color: var(--green); }
+    .neg  { color: var(--red); }
+    .neu  { color: var(--muted); }
+
+    /* Limits card */
+    .limit-block { display: flex; flex-direction: column; gap: 13px; }
+
+    .limit-item { display: flex; flex-direction: column; gap: 5px; }
+
+    .limit-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+    }
+
+    .limit-key {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+    }
+
+    .limit-val {
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+    }
+
+    .track {
+      height: 3px;
+      background: var(--border);
+      border-radius: 99px;
+      overflow: hidden;
+    }
+
+    .fill {
+      height: 100%;
+      border-radius: 99px;
+      transition: width 0.7s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    .fill-ok     { background: var(--blue); }
+    .fill-warn   { background: var(--yellow); }
+    .fill-danger { background: var(--red); }
+
+    /* ─── CHART CARD ──────────────────────────────────────────── */
+    .chart-card {
+      padding: 20px 22px 18px;
+      animation-delay: 0.20s;
+    }
+
+    .chart-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 18px;
+    }
+
+    #chartRange {
+      font-size: 12px;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .chart-wrap {
+      position: relative;
+      height: 210px;
+    }
+
+    .chart-empty {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 210px;
+      color: var(--muted-2);
+      font-size: 12px;
+      border: 1px dashed var(--border);
+      border-radius: 6px;
+      text-align: center;
+      padding: 24px;
+      line-height: 1.7;
+    }
+
+    /* ─── BOTTOM GRID ─────────────────────────────────────────── */
+    .bottom-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      align-items: start;
+    }
+
+    .bottom-grid .card:nth-child(1) { animation-delay: 0.26s; }
+    .bottom-grid .card:nth-child(2) { animation-delay: 0.30s; }
+
+    /* ─── TABLES ──────────────────────────────────────────────── */
+    .tbl {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    .tbl thead th {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted-2);
+      font-weight: 500;
+      padding: 0 10px 9px 0;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+
+    .tbl thead th:last-child  { padding-right: 0; }
+
+    .tbl tbody tr {
+      border-bottom: 1px solid var(--border-subtle);
+      transition: background 0.12s;
+    }
+
+    .tbl tbody tr:last-child { border-bottom: none; }
+    .tbl tbody tr:hover      { background: var(--surface-hover); }
+
+    .tbl td {
+      padding: 9px 10px 9px 0;
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      vertical-align: middle;
+    }
+
+    .tbl td:last-child { padding-right: 0; }
+
+    .sym {
+      font-weight: 600;
+      font-size: 13px;
+      color: var(--text);
+      letter-spacing: -0.01em;
+    }
+
+    .dim { color: var(--muted); }
+
+    /* ─── BADGES ──────────────────────────────────────────────── */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .b-buy  { background: var(--green-dim); color: var(--green); border: 1px solid var(--green-border); }
+    .b-sell { background: var(--red-dim);   color: var(--red);   border: 1px solid var(--red-border);   }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-size: 9px;
+      font-weight: 500;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      border: 1px solid var(--border);
+      color: var(--muted-2);
+    }
+
+    /* ─── EMPTY / SCROLL ──────────────────────────────────────── */
+    .empty {
+      padding: 28px 0;
+      text-align: center;
+      color: var(--muted-2);
+      font-size: 12px;
+    }
+
+    .scroll {
+      max-height: 360px;
+      overflow-y: auto;
+    }
+
+    .scroll::-webkit-scrollbar { width: 3px; }
+    .scroll::-webkit-scrollbar-track { background: transparent; }
+    .scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 99px; }
+
+    /* ─── RESPONSIVE ──────────────────────────────────────────── */
+    @media (max-width: 1020px) {
+      .stats-row { grid-template-columns: 1fr 1fr; }
+    }
+
+    @media (max-width: 700px) {
+      main { padding: 14px 14px 40px; gap: 12px; }
+      header { padding: 0 16px; }
+      .stats-row { grid-template-columns: 1fr 1fr; }
+      .bottom-grid { grid-template-columns: 1fr; }
+      .stat-value { font-size: 22px; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="h-left">
+    <span class="logo">Trading Bot</span>
+    <div class="live-pill"><div class="live-dot"></div>Live</div>
+  </div>
+  <span id="lastUpdated">—</span>
+</header>
+
+<main>
+
+  <!-- ── Stats row ──────────────────────────────────────────── -->
+  <div class="stats-row">
+    <div class="card">
+      <div class="card-label">Portfolio Equity</div>
+      <div class="stat-value" id="sEquity">—</div>
+      <div class="stat-sub neu" id="sDelta">—</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Cash Available</div>
+      <div class="stat-value" id="sCash">—</div>
+      <div class="stat-sub neu" id="sBP">Buying power: —</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Open Positions</div>
+      <div class="stat-value" id="sPositions">—</div>
+      <div class="stat-sub neu" id="sTotalPL">Unrealized P&amp;L: —</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Trade Limits</div>
+      <div class="limit-block">
+        <div class="limit-item">
+          <div class="limit-top">
+            <span class="limit-key">Daily</span>
+            <span class="limit-val" id="lDaily">— / —</span>
+          </div>
+          <div class="track"><div class="fill fill-ok" id="lDailyBar" style="width:0%"></div></div>
+        </div>
+        <div class="limit-item">
+          <div class="limit-top">
+            <span class="limit-key">Weekly</span>
+            <span class="limit-val" id="lWeekly">— / —</span>
+          </div>
+          <div class="track"><div class="fill fill-ok" id="lWeeklyBar" style="width:0%"></div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Chart ──────────────────────────────────────────────── -->
+  <div class="card chart-card">
+    <div class="chart-top">
+      <div class="card-label" style="margin-bottom:0">Portfolio Value — Last 7 Days</div>
+      <span id="chartRange" class="neu">—</span>
+    </div>
+    <div class="chart-wrap">
+      <canvas id="portfolioChart" style="display:none"></canvas>
+      <div class="chart-empty" id="chartEmpty" style="display:none">
+        No snapshot data yet.<br>
+        The bot records equity at market open &amp; close each trading day.
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Positions + Transactions ───────────────────────────── -->
+  <div class="bottom-grid">
+    <div class="card">
+      <div class="card-label">Open Positions</div>
+      <div id="posWrap"><div class="empty">Loading…</div></div>
+    </div>
+    <div class="card">
+      <div class="card-label">Recent Transactions</div>
+      <div id="txWrap"><div class="empty">Loading…</div></div>
+    </div>
+  </div>
+
+</main>
+
+<script>
+  // ── helpers ─────────────────────────────────────────────────────────────
+  const $ = id => document.getElementById(id);
+  const usd = n => n != null
+    ? '$' + Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})
+    : '—';
+  const fmtDate = s => {
+    const [y,m,d] = s.split('-');
+    return new Date(y, m-1, d).toLocaleDateString('en-US', {month:'short', day:'numeric'});
+  };
+  const fmtTs = ts => new Date(ts * 1000).toLocaleString('en-US', {
+    month:'short', day:'numeric', hour:'numeric', minute:'2-digit', hour12:true
+  });
+  const srcLabel = s => ({ta:'TA', signal:'SIG', 'stop-loss':'STOP', 'trailing-stop':'TRAIL'}[s] || (s||'').toUpperCase().slice(0,5));
+
+  let portfolioChart = null;
+
+  // ── summary ──────────────────────────────────────────────────────────────
+  function renderSummary(d) {
+    $('sEquity').textContent = usd(d.equity);
+    $('sCash').textContent   = usd(d.cash);
+    $('sBP').textContent     = 'Buying power: ' + usd(d.buying_power);
+    const el = $('sDelta');
+    if (d.open_equity != null) {
+      const diff = d.equity - d.open_equity;
+      const pct  = (diff / d.open_equity * 100).toFixed(2);
+      const sign = diff >= 0 ? '+' : '';
+      el.textContent = `Today: ${sign}${usd(diff)} (${sign}${pct}%)`;
+      el.className   = 'stat-sub ' + (diff >= 0 ? 'pos' : 'neg');
+    } else {
+      el.textContent = 'No open snapshot today';
+      el.className   = 'stat-sub neu';
+    }
+  }
+
+  // ── positions ────────────────────────────────────────────────────────────
+  function renderPositions(positions) {
+    const totalPL = positions.reduce((s, p) => s + (p.unrealized_pl || 0), 0);
+    $('sPositions').textContent = positions.length;
+    const plEl = $('sTotalPL');
+    plEl.textContent = 'Unrealized P&L: ' + (totalPL >= 0 ? '+' : '') + usd(totalPL);
+    plEl.className   = 'stat-sub ' + (totalPL >= 0 ? 'pos' : 'neg');
+
+    const wrap = $('posWrap');
+    if (!positions.length) {
+      wrap.innerHTML = '<div class="empty">No open positions</div>';
+      return;
+    }
+    const rows = positions.map(p => {
+      const pl   = p.unrealized_pl || 0;
+      const sign = pl >= 0 ? '+' : '';
+      return `<tr>
+        <td><span class="sym">${p.symbol}</span></td>
+        <td>${Number(p.qty).toLocaleString('en-US', {maximumFractionDigits:4})}</td>
+        <td>${usd(p.entry_price)}</td>
+        <td>${usd(p.current_price)}</td>
+        <td class="${pl >= 0 ? 'pos' : 'neg'}">${sign}${usd(pl)}</td>
+      </tr>`;
+    }).join('');
+    wrap.innerHTML = `<table class="tbl">
+      <thead><tr>
+        <th>Symbol</th><th>Qty</th><th>Entry</th><th>Current</th><th>P&amp;L</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+  }
+
+  // ── transactions ─────────────────────────────────────────────────────────
+  function renderTransactions(txns) {
+    const wrap = $('txWrap');
+    if (!txns.length) {
+      wrap.innerHTML = '<div class="empty">No transactions yet</div>';
+      return;
+    }
+    const rows = txns.map(t => {
+      const bc  = t.side === 'BUY' ? 'b-buy' : 'b-sell';
+      const qty = t.qty && t.qty > 0
+        ? Number(t.qty).toLocaleString('en-US', {maximumFractionDigits:4}) + ' sh'
+        : 'notional';
+      const tag = t.source ? `<span class="tag">${srcLabel(t.source)}</span>` : '';
+      return `<tr>
+        <td><span class="badge ${bc}">${t.side}</span></td>
+        <td><span class="sym">${t.symbol}</span></td>
+        <td class="dim">${qty}</td>
+        <td>${t.price != null ? usd(t.price) : '—'}</td>
+        <td>${tag}</td>
+        <td class="dim" style="text-align:right;white-space:nowrap">${fmtTs(t.timestamp_utc)}</td>
+      </tr>`;
+    }).join('');
+    wrap.innerHTML = `<div class="scroll"><table class="tbl">
+      <thead><tr>
+        <th>Side</th><th>Symbol</th><th>Qty</th><th>Price</th><th>Source</th>
+        <th style="text-align:right">Time</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>`;
+  }
+
+  // ── chart ────────────────────────────────────────────────────────────────
+  function renderChart(data) {
+    const canvas = $('portfolioChart');
+    const empty  = $('chartEmpty');
+    if (!data || !data.length) {
+      canvas.style.display = 'none';
+      empty.style.display  = 'flex';
+      return;
+    }
+    canvas.style.display = 'block';
+    empty.style.display  = 'none';
+
+    const labels = data.map(d => fmtDate(d.date));
+    const values = data.map(d => d.equity);
+    const isUp   = values.length < 2 || values[values.length - 1] >= values[0];
+    const accent = isUp ? '#3fb950' : '#f85149';
+    const aRgb   = isUp ? '63,185,80' : '248,81,73';
+
+    // 7-day range stat
+    const rangeEl = $('chartRange');
+    if (values.length >= 2) {
+      const diff = values[values.length - 1] - values[0];
+      const pct  = (diff / values[0] * 100).toFixed(2);
+      const sign = diff >= 0 ? '+' : '';
+      rangeEl.textContent = `${sign}${usd(diff)} (${sign}${pct}%) 7d`;
+      rangeEl.className   = isUp ? 'pos' : 'neg';
+    } else {
+      rangeEl.textContent = usd(values[0]);
+      rangeEl.className   = 'neu';
+    }
+
+    const ctx  = canvas.getContext('2d');
+    const grad = ctx.createLinearGradient(0, 0, 0, 210);
+    grad.addColorStop(0,   `rgba(${aRgb},0.18)`);
+    grad.addColorStop(0.5, `rgba(${aRgb},0.06)`);
+    grad.addColorStop(1,   `rgba(${aRgb},0)`);
+
+    if (portfolioChart) portfolioChart.destroy();
+    portfolioChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [{
+          data: values,
+          borderColor: accent,
+          borderWidth: 2,
+          backgroundColor: grad,
+          fill: true,
+          pointRadius: 4,
+          pointHoverRadius: 7,
+          pointBackgroundColor: accent,
+          pointBorderColor: '#0d1117',
+          pointBorderWidth: 2,
+          tension: 0.35,
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: { duration: 700, easing: 'easeInOutQuart' },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            backgroundColor: '#1c2128',
+            borderColor: '#30363d',
+            borderWidth: 1,
+            titleColor: '#7d8590',
+            bodyColor: '#e6edf3',
+            padding: 11,
+            titleFont: { family: "'JetBrains Mono', monospace", size: 11 },
+            bodyFont:  { family: "'JetBrains Mono', monospace", size: 13, weight: '600' },
+            callbacks: { label: c => ' ' + usd(c.parsed.y) }
+          }
+        },
+        scales: {
+          x: {
+            grid:   { color: 'rgba(48,54,61,0.45)' },
+            ticks:  { color: '#7d8590', font: { family: "'JetBrains Mono', monospace", size: 11 }, maxRotation: 0 },
+            border: { display: false },
+          },
+          y: {
+            position: 'right',
+            grid:   { color: 'rgba(48,54,61,0.45)' },
+            ticks:  {
+              color: '#7d8590',
+              font: { family: "'JetBrains Mono', monospace", size: 11 },
+              callback: v => '$' + Number(v).toLocaleString('en-US', {maximumFractionDigits: 0}),
+              maxTicksLimit: 5,
+            },
+            border: { display: false },
+          }
+        }
+      }
+    });
+  }
+
+  // ── trade counts ─────────────────────────────────────────────────────────
+  function renderTradeCounts(d) {
+    $('lDaily').textContent  = `${d.daily} / ${d.daily_max}`;
+    $('lWeekly').textContent = `${d.weekly} / ${d.weekly_max}`;
+    function setBar(id, pct) {
+      const el = $(id);
+      el.style.width = Math.min(100, pct) + '%';
+      el.className   = 'fill ' + (pct >= 100 ? 'fill-danger' : pct >= 66 ? 'fill-warn' : 'fill-ok');
+    }
+    setBar('lDailyBar',  (d.daily  / d.daily_max)  * 100);
+    setBar('lWeeklyBar', (d.weekly / d.weekly_max) * 100);
+  }
+
+  // ── load all ─────────────────────────────────────────────────────────────
+  async function loadAll() {
+    $('lastUpdated').textContent = 'Refreshing…';
+    const [sum, pos, txn, hist, cnts] = await Promise.allSettled([
+      fetch('/api/summary').then(r => r.json()),
+      fetch('/api/positions').then(r => r.json()),
+      fetch('/api/transactions').then(r => r.json()),
+      fetch('/api/portfolio-history').then(r => r.json()),
+      fetch('/api/trade-counts').then(r => r.json()),
+    ]);
+    if (sum.status  === 'fulfilled' && !sum.value?.error)    renderSummary(sum.value);
+    if (pos.status  === 'fulfilled' && Array.isArray(pos.value)) renderPositions(pos.value);
+    if (txn.status  === 'fulfilled' && Array.isArray(txn.value)) renderTransactions(txn.value);
+    if (hist.status === 'fulfilled' && Array.isArray(hist.value)) renderChart(hist.value);
+    if (cnts.status === 'fulfilled' && !cnts.value?.error)   renderTradeCounts(cnts.value);
+    $('lastUpdated').textContent = 'Updated ' +
+      new Date().toLocaleTimeString('en-US', {hour:'numeric', minute:'2-digit', second:'2-digit'});
+  }
+
+  loadAll();
+  setInterval(loadAll, 60_000);
+</script>
+</body>
+</html>

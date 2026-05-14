@@ -95,12 +95,40 @@ def _dramatize(message: str, level: str) -> str:
     return f"**{message}**"
 
 
+def _build_trade_embed(message: str) -> dict:
+    """Discord embed with color-coded border for buy/sell alerts."""
+    msg_upper = message.upper()
+    if "STOP-LOSS" in msg_upper or "STOP LOSS" in msg_upper:
+        color = 0xC0392B  # dark red
+        flair = random.choice(STOP_LOSS_LINES)
+    elif "TRAILING-STOP" in msg_upper:
+        color = 0xE67E22  # orange
+        flair = random.choice(SELL_LINES)
+    elif "SELL" in msg_upper:
+        color = 0xE74C3C  # red
+        flair = random.choice(SELL_LINES)
+    else:
+        color = 0x2ECC71  # green
+        flair = random.choice(BUY_LINES)
+    return {
+        "embeds": [{
+            "description": f"**{message}**",
+            "color": color,
+            "footer": {"text": flair},
+        }]
+    }
+
+
 def _send_discord(message: str, level: str) -> None:
     import requests
-    content = _dramatize(message, level)
-    if len(content) > 2000:
-        content = content[:1997] + "..."
-    requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=5)
+    if level == "trade":
+        payload = _build_trade_embed(message)
+    else:
+        content = _dramatize(message, level)
+        if len(content) > 2000:
+            content = content[:1997] + "..."
+        payload = {"content": content}
+    requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5)
 
 
 def _send_email(message: str, level: str) -> None:

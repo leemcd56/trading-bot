@@ -46,6 +46,7 @@ trading_client = TradingClient(
 
 TRADE_LOG_TABLE = "trade_log"
 TRAIL_STATE_TABLE = "trail_state"
+TRADE_HISTORY_TABLE = "trade_history"
 
 
 def _ensure_trade_log(con: duckdb.DuckDBPyConnection) -> None:
@@ -62,6 +63,32 @@ def _ensure_trade_log(con: duckdb.DuckDBPyConnection) -> None:
         con.execute(f"ALTER TABLE {TRADE_LOG_TABLE} ADD COLUMN qty DOUBLE")
     except Exception:
         pass  # column already exists
+
+
+def _ensure_trade_history(con: duckdb.DuckDBPyConnection) -> None:
+    con.execute(f"""
+        CREATE TABLE IF NOT EXISTS {TRADE_HISTORY_TABLE} (
+            timestamp_utc DOUBLE,
+            symbol VARCHAR,
+            side VARCHAR,
+            qty DOUBLE,
+            price DOUBLE,
+            source VARCHAR
+        )
+    """)
+
+
+def _record_trade_history(symbol: str, side: str, qty: float, price: float | None, source: str) -> None:
+    """Persist a human-readable trade record with price for EOD reporting."""
+    con = duckdb.connect(DB_PATH)
+    try:
+        _ensure_trade_history(con)
+        con.execute(
+            f"INSERT INTO {TRADE_HISTORY_TABLE} (timestamp_utc, symbol, side, qty, price, source) VALUES (?, ?, ?, ?, ?, ?)",
+            [time.time(), symbol, side, qty or 0, price, source],
+        )
+    finally:
+        con.close()
 
 
 def _ensure_trail_state(con: duckdb.DuckDBPyConnection) -> None:
@@ -399,6 +426,7 @@ def execute_trade(symbol: str, analysis: dict | None):
                     send_alert(f"Stop-loss order FAILED for {symbol}: {order_err}", "error")
                     return
                 _record_trade(symbol, "SELL", qty)
+                _record_trade_history(symbol, "SELL", qty, current, "stop-loss")
                 _clear_trail_state(symbol)
                 logger.warning(f"Stop-loss SELL for {symbol}: price {current:.2f} <= entry {entry:.2f} * (1 - {STOP_LOSS_PCT:.0%})")
                 send_alert(f"Stop-loss SELL {symbol} qty={qty:.4g} @ {current:.2f} (entry {entry:.2f})", "trade")
@@ -431,6 +459,7 @@ def execute_trade(symbol: str, analysis: dict | None):
                     send_alert(f"Trailing-stop order FAILED for {symbol}: {order_err}", "error")
                     return
                 _record_trade(symbol, "SELL", qty)
+                _record_trade_history(symbol, "SELL", qty, current, "trailing-stop")
                 _clear_trail_state(symbol)
                 logger.warning(f"Trailing-stop SELL for {symbol}: price {current:.2f} <= running_high {running_high:.2f} * (1 - {TRAIL_PCT:.0%})")
                 send_alert(f"Trailing-stop SELL {symbol} qty={qty:.4g} @ {current:.2f} (running_high {running_high:.2f})", "trade")
@@ -476,6 +505,7 @@ def execute_trade(symbol: str, analysis: dict | None):
                     send_alert(f"BUY order FAILED for {symbol}: {order_err}", "error")
                     return
                 _record_trade(symbol, "BUY", 1)
+                _record_trade_history(symbol, "BUY", 1, price, "ta")
                 logger.info(f"BUY submitted for {symbol} qty=1 (whole share, price ${price:.2f} <= ${NOTIONAL_PER_TRADE})")
                 send_alert(f"BUY {symbol} 1 share @ ~${price:.2f}", "trade")
             else:
@@ -497,6 +527,7 @@ def execute_trade(symbol: str, analysis: dict | None):
                     send_alert(f"BUY order FAILED for {symbol}: {order_err}", "error")
                     return
                 _record_trade(symbol, "BUY", 0)
+                _record_trade_history(symbol, "BUY", 0, analysis.get("current_price"), "ta")
                 logger.info(f"BUY submitted for {symbol} notional=${notional:.2f}")
                 send_alert(f"BUY {symbol} ${notional:.2f}", "trade")
         else:
@@ -518,6 +549,7 @@ def execute_trade(symbol: str, analysis: dict | None):
                 send_alert(f"BUY order FAILED for {symbol}: {order_err}", "error")
                 return
             _record_trade(symbol, "BUY", qty)
+            _record_trade_history(symbol, "BUY", qty, analysis.get("current_price"), "ta")
             logger.info(f"BUY submitted for {symbol} qty={qty}")
             send_alert(f"BUY {symbol} qty={qty}", "trade")
 
@@ -555,6 +587,7 @@ def execute_trade(symbol: str, analysis: dict | None):
                     send_alert(f"SELL order FAILED for {symbol}: {order_err}", "error")
                     return
                 _record_trade(symbol, "SELL", qty)
+                _record_trade_history(symbol, "SELL", qty, analysis.get("current_price"), "ta")
                 _clear_trail_state(symbol)
                 logger.info(f"SELL submitted for {symbol}")
                 send_alert(f"SELL {symbol} qty={qty:.4g}", "trade")
@@ -562,7 +595,7 @@ def execute_trade(symbol: str, analysis: dict | None):
         reasons = _skip_reasons_buy(analysis)
         scorecard = _buy_gate_scorecard(analysis)
         logger.info(f"{symbol}: No signal - {scorecard} | {', '.join(reasons)}")
-        send_alert(f"{symbol}: No signal — {scorecard} | {', '.join(reasons)}", "hodl")
+        return f"{symbol}: {scorecard}"
 
 
 # ─── Signal-based execution (external oracle, bypasses TA gates) ───────────────
@@ -609,6 +642,7 @@ def execute_signal_buy(symbol: str) -> None:
                 send_alert(f"[signal] BUY order FAILED for {symbol}: {order_err}", "error")
                 return
             _record_trade(symbol, "BUY", 1)
+            _record_trade_history(symbol, "BUY", 1, price, "signal")
             logger.info(f"{symbol} [signal]: BUY submitted qty=1 (whole share @ ~${price:.2f})")
             send_alert(f"[signal] BUY {symbol} 1 share @ ~${price:.2f}", "trade")
         else:
@@ -627,10 +661,12 @@ def execute_signal_buy(symbol: str) -> None:
                 send_alert(f"[signal] BUY order FAILED for {symbol}: {order_err}", "error")
                 return
             _record_trade(symbol, "BUY", 0)
+            _record_trade_history(symbol, "BUY", 0, price, "signal")
             logger.info(f"{symbol} [signal]: BUY submitted notional=${notional:.2f}")
             send_alert(f"[signal] BUY {symbol} ${notional:.2f}", "trade")
     else:
         # Qty mode (no notional configured): buy 1 share.
+        intraday_price = get_intraday_price(symbol)
         order = MarketOrderRequest(
             symbol=symbol, qty=1, side=OrderSide.BUY, time_in_force=TimeInForce.DAY
         )
@@ -641,6 +677,7 @@ def execute_signal_buy(symbol: str) -> None:
             send_alert(f"[signal] BUY order FAILED for {symbol}: {order_err}", "error")
             return
         _record_trade(symbol, "BUY", 1)
+        _record_trade_history(symbol, "BUY", 1, intraday_price, "signal")
         logger.info(f"{symbol} [signal]: BUY submitted qty=1")
         send_alert(f"[signal] BUY {symbol} qty=1", "trade")
 
@@ -699,7 +736,9 @@ def execute_signal_sell(symbol: str) -> None:
         logger.error(f"{symbol} [signal]: SELL order failed: {order_err}")
         send_alert(f"[signal] SELL order FAILED for {symbol}: {order_err}", "error")
         return
+    sell_price = get_intraday_price(symbol)
     _record_trade(symbol, "SELL", qty)
+    _record_trade_history(symbol, "SELL", qty, sell_price, "signal")
     _clear_trail_state(symbol)
     logger.info(f"{symbol} [signal]: SELL submitted qty={qty:.4g}")
     send_alert(f"[signal] SELL {symbol} qty={qty:.4g}", "trade")
