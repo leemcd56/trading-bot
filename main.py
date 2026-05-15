@@ -73,9 +73,13 @@ def open_snapshot_job():
     """Capture market-open portfolio equity once per trading day."""
     if not is_market_open():
         return
-    equity = snapshot_portfolio("open")
-    if equity is not None:
-        logger.info(f"Market-open snapshot: ${equity:,.2f}")
+    try:
+        equity = snapshot_portfolio("open")
+        if equity is not None:
+            logger.info(f"Market-open snapshot: ${equity:,.2f}")
+    except Exception as e:
+        logger.error(f"Open snapshot failed: {e}")
+        send_alert(f"Open snapshot failed: {e}", "error")
 
 
 def eod_job():
@@ -83,7 +87,12 @@ def eod_job():
     now_et = datetime.datetime.now(_ET)
     if now_et.weekday() >= 5 or now_et.hour < 16:
         return
-    equity = snapshot_portfolio("close")
+    try:
+        equity = snapshot_portfolio("close")
+    except Exception as e:
+        logger.error(f"EOD snapshot failed: {e}")
+        send_alert(f"EOD snapshot failed: {e}", "error")
+        return
     if equity is not None:
         logger.info(f"Market-close snapshot: ${equity:,.2f}")
         try:

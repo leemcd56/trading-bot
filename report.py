@@ -135,32 +135,43 @@ def fetch_daily_weekly_counts():
         con.close()
 
 
-def snapshot_portfolio(label: str) -> float | None:
+def snapshot_portfolio(label: str, _retries: int = 3, _backoff: float = 5.0) -> float | None:
     """
     Fetch current equity from Alpaca and store it in portfolio_snapshots.
     Idempotent: returns None (and skips the insert) if this label already
     exists for today's ET date. Returns the equity on first call.
+    Retries on transient MotherDuck CatalogException errors.
     """
     date_et = datetime.now(_ET).strftime("%Y-%m-%d")
-    con = duckdb.connect(DB_PATH)
-    try:
-        _ensure_portfolio_snapshots(con)
-        if con.execute(
-            f"SELECT 1 FROM {PORTFOLIO_SNAPSHOTS_TABLE} WHERE date_et = ? AND label = ? LIMIT 1",
-            [date_et, label],
-        ).fetchone():
-            return None
-        account = fetch_account_summary()
-        if not account:
-            return None
-        equity = account["equity"]
-        con.execute(
-            f"INSERT INTO {PORTFOLIO_SNAPSHOTS_TABLE} (timestamp_utc, date_et, label, equity) VALUES (?, ?, ?, ?)",
-            [time.time(), date_et, label, equity],
-        )
-        return equity
-    finally:
-        con.close()
+    for attempt in range(_retries):
+        con = duckdb.connect(DB_PATH)
+        try:
+            _ensure_portfolio_snapshots(con)
+            if con.execute(
+                f"SELECT 1 FROM {PORTFOLIO_SNAPSHOTS_TABLE} WHERE date_et = ? AND label = ? LIMIT 1",
+                [date_et, label],
+            ).fetchone():
+                return None
+            account = fetch_account_summary()
+            if not account:
+                return None
+            equity = account["equity"]
+            con.execute(
+                f"INSERT INTO {PORTFOLIO_SNAPSHOTS_TABLE} (timestamp_utc, date_et, label, equity) VALUES (?, ?, ?, ?)",
+                [time.time(), date_et, label, equity],
+            )
+            return equity
+        except duckdb.CatalogException:
+            con.close()
+            if attempt < _retries - 1:
+                time.sleep(_backoff * (attempt + 1))
+            else:
+                raise
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
 
 
 def fetch_todays_trades() -> list:
