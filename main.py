@@ -10,7 +10,20 @@ from signals import fetch_signals
 from utils import logger, is_market_open
 from alerts import send_alert
 from report import snapshot_portfolio, send_eod_summary
-from config import SYMBOLS, CHECK_INTERVAL_MINUTES, FMP_CHECK_INTERVAL_MINUTES
+from config import (
+    SYMBOLS,
+    CHECK_INTERVAL_MINUTES,
+    FMP_CHECK_INTERVAL_MINUTES,
+    TRADING_MODE,
+    MAX_DAILY_TRADES,
+    MAX_WEEKLY_TRADES,
+    MAX_OPEN_POSITIONS,
+    STOP_LOSS_PCT,
+    TRAIL_ACTIVATION_PCT,
+    TRAIL_PCT,
+    NOTIONAL_PER_TRADE,
+    ADX_STRONG_TREND_THRESHOLD,
+)
 
 _ET = pytz.timezone("US/Eastern")
 
@@ -116,7 +129,13 @@ if __name__ == "__main__":
     schedule.every(15).minutes.do(open_snapshot_job)
     schedule.every(15).minutes.do(eod_job)
 
-    logger.info(f"Trading bot started. Watching symbols: {SYMBOLS}")
+    logger.info(
+        f"Trading bot started | mode={TRADING_MODE.upper()} | symbols={SYMBOLS} | "
+        f"daily_cap={MAX_DAILY_TRADES} weekly_cap={MAX_WEEKLY_TRADES} "
+        f"max_positions={MAX_OPEN_POSITIONS} | "
+        f"stop={STOP_LOSS_PCT:.0%} trail_activate={TRAIL_ACTIVATION_PCT:.0%} trail={TRAIL_PCT:.0%} | "
+        f"notional=${NOTIONAL_PER_TRADE} adx_threshold={ADX_STRONG_TREND_THRESHOLD}"
+    )
     # Run both jobs immediately so we see activity right away (e.g. in Railway logs).
     fmp_job()
     ta_job()
