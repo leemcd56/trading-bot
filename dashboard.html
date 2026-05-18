@@ -368,6 +368,155 @@
     .scroll::-webkit-scrollbar-track { background: transparent; }
     .scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 99px; }
 
+    /* ─── MODE BADGE ─────────────────────────────────────────── */
+    .mode-badge {
+      position: relative;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 10px 3px 8px;
+      border-radius: 20px;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      user-select: none;
+      overflow: visible;
+    }
+
+    .mode-icon {
+      font-size: 12px;
+      line-height: 1;
+      display: inline-block;
+    }
+
+    /* — Aggressive: shakes and crackles every 5s — */
+    .mode-badge.mode-aggressive {
+      background: rgba(248, 81, 73, 0.12);
+      border: 1px solid rgba(248, 81, 73, 0.35);
+      color: #f85149;
+      animation: aggr-rumble 5s ease-in-out infinite;
+    }
+    .mode-badge.mode-aggressive .mode-icon {
+      animation: aggr-bolt 5s ease-in-out infinite;
+    }
+    @keyframes aggr-rumble {
+      0%,  70%, 100% { transform: translate(0);       box-shadow: none; }
+      72%            { transform: translate(-2px, 0);  box-shadow: 0 0 10px rgba(248,81,73,0.55); }
+      74%            { transform: translate( 3px, 0);  box-shadow: 0 0 14px rgba(248,81,73,0.75); }
+      76%            { transform: translate(-3px, 0);  box-shadow: 0 0 18px rgba(248,81,73,0.9); }
+      78%            { transform: translate( 2px, 0);  box-shadow: 0 0 10px rgba(248,81,73,0.55); }
+      80%            { transform: translate(-1px, 0);  box-shadow: 0 0 6px rgba(248,81,73,0.3); }
+      82%            { transform: translate(0);        box-shadow: none; }
+    }
+    @keyframes aggr-bolt {
+      0%,  70%, 82%, 100% { color: #f85149; filter: none; }
+      72%, 76%            { color: #ffd700; filter: drop-shadow(0 0 5px #ffd700); }
+      74%, 78%            { color: #ff7700; filter: drop-shadow(0 0 8px #ff7700); }
+      80%                 { color: #f85149; filter: drop-shadow(0 0 3px #f85149); }
+    }
+
+    /* — Moderate: slow amber breathing — */
+    .mode-badge.mode-moderate {
+      background: rgba(210, 153, 34, 0.12);
+      border: 1px solid rgba(210, 153, 34, 0.35);
+      color: #d29922;
+      animation: moderate-breathe 4s ease-in-out infinite;
+    }
+    .mode-badge.mode-moderate .mode-icon {
+      animation: moderate-spin 8s linear infinite;
+    }
+    @keyframes moderate-breathe {
+      0%, 100% { opacity: 1;    box-shadow: 0 0 4px rgba(210,153,34,0.15); }
+      50%      { opacity: 0.72; box-shadow: 0 0 10px rgba(210,153,34,0.35); }
+    }
+    @keyframes moderate-spin {
+      from { transform: rotate(0deg); }
+      to   { transform: rotate(360deg); }
+    }
+
+    /* — Conservative: calm double-heartbeat — */
+    .mode-badge.mode-conservative {
+      background: rgba(88, 166, 255, 0.10);
+      border: 1px solid rgba(88, 166, 255, 0.28);
+      color: #58a6ff;
+      animation: cons-heartbeat 2.8s ease-in-out infinite;
+    }
+    @keyframes cons-heartbeat {
+      0%   { transform: scale(1); }
+      9%   { transform: scale(1.05); }
+      15%  { transform: scale(1); }
+      22%  { transform: scale(1.035); }
+      28%  { transform: scale(1); }
+      100% { transform: scale(1); }
+    }
+
+    /* — Swing: side-to-side sway with a bob — */
+    .mode-badge.mode-swing {
+      background: rgba(56, 211, 203, 0.10);
+      border: 1px solid rgba(56, 211, 203, 0.30);
+      color: #38d3cb;
+      animation: swing-sway 3s ease-in-out infinite;
+      transform-origin: center bottom;
+    }
+    .mode-badge.mode-swing .mode-icon {
+      animation: swing-icon-bob 3s ease-in-out infinite;
+    }
+    @keyframes swing-sway {
+      0%   { transform: rotate(0deg) translateY(0); }
+      25%  { transform: rotate(-3deg) translateY(-1px); }
+      75%  { transform: rotate(3deg) translateY(-1px); }
+      100% { transform: rotate(0deg) translateY(0); }
+    }
+    @keyframes swing-icon-bob {
+      0%, 100% { transform: translateY(0) rotate(0deg); }
+      50%      { transform: translateY(-2px) rotate(15deg); }
+    }
+
+    /* — Dormant: sleepy nod, ZZZs drift upward — */
+    .mode-badge.mode-dormant {
+      background: rgba(125, 133, 144, 0.08);
+      border: 1px solid rgba(125, 133, 144, 0.20);
+      color: #7d8590;
+      animation: dormant-nod 5s ease-in-out infinite;
+      transform-origin: center top;
+    }
+    .mode-badge.mode-dormant .mode-icon {
+      animation: dormant-droop 5s ease-in-out infinite;
+    }
+    @keyframes dormant-nod {
+      0%, 100% { transform: rotate(0deg); opacity: 0.9; }
+      40%, 60% { transform: rotate(4deg); opacity: 0.65; }
+      50%      { transform: rotate(6deg); opacity: 0.55; }
+    }
+    @keyframes dormant-droop {
+      0%, 100% { transform: rotate(0deg) translateY(0); }
+      50%      { transform: rotate(10deg) translateY(2px); }
+    }
+
+    .zzz-wrap {
+      position: absolute;
+      top: -4px;
+      right: -6px;
+      pointer-events: none;
+    }
+    .zzz-wrap .z {
+      position: absolute;
+      font-weight: 700;
+      color: rgba(125, 133, 144, 0.55);
+      right: 0;
+      animation: z-drift 3.6s ease-in infinite;
+    }
+    .zzz-wrap .z:nth-child(1) { font-size: 6px;  bottom: 0;    animation-delay: 0s;    }
+    .zzz-wrap .z:nth-child(2) { font-size: 8px;  bottom: 0;    animation-delay: 1.2s;  }
+    .zzz-wrap .z:nth-child(3) { font-size: 10px; bottom: 0;    animation-delay: 2.4s;  }
+    @keyframes z-drift {
+      0%   { opacity: 0;   transform: translate(0px, 0px) rotate(-5deg); }
+      15%  { opacity: 0.8; }
+      80%  { opacity: 0.3; }
+      100% { opacity: 0;   transform: translate(-10px, -22px) rotate(12deg); }
+    }
+
     /* ─── RESPONSIVE ──────────────────────────────────────────── */
     @media (max-width: 1020px) {
       .stats-row { grid-template-columns: 1fr 1fr; }
@@ -388,6 +537,15 @@
   <div class="h-left">
     <span class="logo">Trading Bot</span>
     <div class="live-pill"><div class="live-dot"></div>Live</div>
+    <div id="modeBadge" class="mode-badge" style="display:none">
+      <span class="mode-icon" id="modeIcon"></span>
+      <span id="modeText"></span>
+      <span class="zzz-wrap" id="zzzWrap" style="display:none">
+        <span class="z">z</span>
+        <span class="z">z</span>
+        <span class="z">Z</span>
+      </span>
+    </div>
   </div>
   <span id="lastUpdated">—</span>
 </header>
@@ -686,6 +844,27 @@
     $('lastUpdated').textContent = 'Updated ' +
       new Date().toLocaleTimeString('en-US', {hour:'numeric', minute:'2-digit', second:'2-digit'});
   }
+
+  // ── mode badge ───────────────────────────────────────────────────────────
+  const MODE_META = {
+    aggressive:   { icon: '⚡', label: 'Aggressive' },
+    moderate:     { icon: '◉',  label: 'Moderate' },
+    conservative: { icon: '◇',  label: 'Conservative' },
+    swing:        { icon: '↗',  label: 'Swing' },
+    dormant:      { icon: '💤', label: 'Dormant' },
+  };
+
+  function renderMode(data) {
+    const badge = $('modeBadge');
+    const meta  = MODE_META[data.mode] || { icon: '●', label: data.mode };
+    badge.className              = `mode-badge mode-${data.mode}`;
+    $('modeIcon').textContent    = meta.icon;
+    $('modeText').textContent    = meta.label;
+    $('zzzWrap').style.display   = data.mode === 'dormant' ? 'block' : 'none';
+    badge.style.display          = 'flex';
+  }
+
+  fetch('/api/mode').then(r => r.json()).then(renderMode).catch(() => {});
 
   loadAll();
   setInterval(loadAll, 60_000);

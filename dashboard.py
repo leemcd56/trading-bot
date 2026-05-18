@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 load_dotenv()
 
-from config import DB_PATH, MAX_DAILY_TRADES, MAX_WEEKLY_TRADES
+from config import DB_PATH, MAX_DAILY_TRADES, MAX_WEEKLY_TRADES, TRADING_MODE
 from report import fetch_account_summary, fetch_daily_weekly_counts, fetch_positions
 from trading import TRADE_HISTORY_TABLE
 
@@ -107,6 +107,11 @@ def api_portfolio_history():
         return JSONResponse({"error": str(e)}, status_code=500)
     finally:
         con.close()
+
+
+@app.get("/api/mode")
+def api_mode():
+    return {"mode": TRADING_MODE}
 
 
 @app.get("/api/trade-counts")

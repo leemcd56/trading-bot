@@ -19,6 +19,7 @@ def _patch_trade_limits():
         _count_daily=lambda: 0,
         _count_weekly=lambda: 0,
         _record_trade=lambda symbol, side, qty=0: None,
+        _record_trade_history=lambda *a, **kw: None,
         _should_block_sell_pdt=lambda symbol: False,
         _count_day_trades_in_last_5_days=lambda: 0,
         _get_trail_running_high=lambda symbol: None,

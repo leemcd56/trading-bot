@@ -1,4 +1,5 @@
 import os
+import importlib
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -26,43 +27,52 @@ DB_PATH = f"md:?motherduck_token={_motherduck_token}"
 TRENDS_RETAIN_DAYS = 365      # keep this many days of daily candles per symbol
 TRADE_LOG_RETAIN_DAYS = 30    # keep this many days of trade log (for daily/weekly counts we need 7+)
 
-# Risk limits (no new orders when at cap)
-MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "3"))    # max new orders per calendar day
-MAX_WEEKLY_TRADES = int(os.getenv("MAX_WEEKLY_TRADES", "8"))  # max new orders in rolling 7 calendar days
-MAX_OPEN_POSITIONS = 4  # max symbols held at once (across SYMBOLS)
-
-# Stop-loss: sell if position is down this much from average entry (e.g. 0.05 = 5%)
-STOP_LOSS_PCT = 0.05
-
-# PDT: max day trades in a rolling 5 calendar-day window (stay under 4 to avoid PDT flag)
+# PDT: max day trades in a rolling 5 calendar-day window (stay under 4 to avoid PDT flag).
+# Not mode-specific — this is a regulatory limit.
 MAX_DAY_TRADES_IN_5_DAYS = 3
 
-# Trailing stop: activate when price is this much above entry (e.g. 0.05 = 5%)
-TRAIL_ACTIVATION_PCT = 0.05
-# Once active, sell if price falls this much from running high (e.g. 0.04 = 4%)
-TRAIL_PCT = 0.04
+# ─── Trading mode ────────────────────────────────────────────────────────────────
+# Set TRADING_MODE in .env (or the environment) to one of:
+#   conservative  — infrequent, high-conviction trades; build a nest egg
+#   moderate      — balanced risk/reward (default)
+#   aggressive    — high-frequency day trading; maximize activity and size
+#   swing         — ride multi-day trends with wide stops; let winners run
+#   dormant       — analysis and alerts only; no orders submitted
+#
+# Each mode lives in modes/<name>.py and exports a PARAMS dict.
+# Individual overrides (MAX_DAILY_TRADES, MAX_WEEKLY_TRADES) are still accepted
+# as env vars and take priority over the mode's defaults.
 
-# Position sizing: risk this fraction of equity per trade (e.g. 0.01 = 1%)
-# Set to None to use fixed qty=1 instead of risk-based sizing (ignored when NOTIONAL_PER_TRADE is set)
-RISK_PCT_PER_TRADE = 0.01
-# Cap position value at this fraction of equity per symbol (e.g. 0.10 = 10%)
-MAX_POSITION_PCT_EQUITY = 0.10
-# Min/max shares per order (when using qty-based sizing, not notional)
-MIN_SHARES = 1
-MAX_SHARES = 100
+_VALID_MODES = ("conservative", "moderate", "aggressive", "swing", "dormant")
+TRADING_MODE = os.getenv("TRADING_MODE", "moderate").lower().strip()
+if TRADING_MODE not in _VALID_MODES:
+    raise RuntimeError(
+        f"Invalid TRADING_MODE '{TRADING_MODE}'. Must be one of: {', '.join(_VALID_MODES)}"
+    )
 
-# Fractional / small-account mode: when set, each BUY is this many dollars (notional) instead of shares.
-# Example: 75 = buy $75 of the symbol per trade (fractional shares). Alpaca minimum is $1.
-# Set to None to use qty-based sizing above.
-NOTIONAL_PER_TRADE = 75
+_mode = importlib.import_module(f"modes.{TRADING_MODE}").PARAMS
 
-# Entry tuning (conservative, but not overly restrictive)
-# Minimum ADX value to consider a trend "strong enough" to trade.
-# 25 is the classic threshold but can miss moderate trends; 20 is a reasonable lower bound.
-ADX_STRONG_TREND_THRESHOLD = 18
-# Treat price as "near upper band" when within this fraction below BB upper band.
-# Example: 0.015 = within 1.5% of upper band.
-NEAR_UPPER_BAND_TOLERANCE = 0.025
-# Block entries only when today's move vs yesterday is very small.
-# Example: 0.01 = less than 1% move is considered "similar".
-SIMILAR_TO_YESTERDAY_PCT = 0.01
+# ─── Risk limits ─────────────────────────────────────────────────────────────────
+# MAX_DAILY_TRADES and MAX_WEEKLY_TRADES can be overridden via env vars; all others
+# come directly from the selected mode.
+
+MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", str(_mode["MAX_DAILY_TRADES"])))
+MAX_WEEKLY_TRADES = int(os.getenv("MAX_WEEKLY_TRADES", str(_mode["MAX_WEEKLY_TRADES"])))
+MAX_OPEN_POSITIONS = _mode["MAX_OPEN_POSITIONS"]
+
+# Stop-loss / trailing stop
+STOP_LOSS_PCT = _mode["STOP_LOSS_PCT"]
+TRAIL_ACTIVATION_PCT = _mode["TRAIL_ACTIVATION_PCT"]
+TRAIL_PCT = _mode["TRAIL_PCT"]
+
+# Position sizing
+RISK_PCT_PER_TRADE = _mode["RISK_PCT_PER_TRADE"]
+MAX_POSITION_PCT_EQUITY = _mode["MAX_POSITION_PCT_EQUITY"]
+MIN_SHARES = _mode["MIN_SHARES"]
+MAX_SHARES = _mode["MAX_SHARES"]
+NOTIONAL_PER_TRADE = _mode["NOTIONAL_PER_TRADE"]
+
+# Entry filters
+ADX_STRONG_TREND_THRESHOLD = _mode["ADX_STRONG_TREND_THRESHOLD"]
+NEAR_UPPER_BAND_TOLERANCE = _mode["NEAR_UPPER_BAND_TOLERANCE"]
+SIMILAR_TO_YESTERDAY_PCT = _mode["SIMILAR_TO_YESTERDAY_PCT"]
