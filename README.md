@@ -2,7 +2,7 @@
 
 A low-frequency, trend-following stock trading system in Python. Uses **Alpaca** for execution (paper trading first), **Yahoo Finance** for daily candles (Finnhub as fallback), **MotherDuck/DuckDB** for storage, **TA-Lib** for technical indicators, and optionally **Financial Modeling Prep** for analyst signal feeds. The bot runs on a schedule during US market hours and only trades when multiple confirmations align.
 
-**Philosophy:** Conservative—infrequent trades, strong trend filters, no “buy the dip.” Paper trade until thoroughly validated.
+**Philosophy:** Strong trend filters, no “buy the dip,” and configurable risk appetite via **trading modes** — from nest-egg conservative to bleeding-edge aggressive. Paper trade until thoroughly validated.
 
 ---
 
@@ -45,6 +45,7 @@ Edit `.env`:
 - **Finnhub (optional fallback):** `FINNHUB_API_KEY` from [Finnhub](https://finnhub.io/). Used if Yahoo Finance fails.
 - **MotherDuck (required):** Set `MOTHERDUCK_TOKEN` — the bot uses [MotherDuck](https://motherduck.com) hosted DuckDB exclusively and will not start without it. Data (candles, trade log) lives in the cloud and survives redeploys or machine loss.
 - **FMP (optional):** Set `FMP_API_KEY` from [Financial Modeling Prep](https://financialmodelingprep.com/developer/docs) to enable the analyst signal feed. When set, the bot queries today's analyst upgrades/downgrades each hour and trades on them without requiring TA confirmation. Free tier (250 calls/day) is sufficient.
+- **Trading mode (optional):** Set `TRADING_MODE` to one of `conservative`, `moderate` (default), `aggressive`, `swing`, or `dormant`. See [Trading Modes](#trading-modes) below.
 
 Never commit `.env`; it is gitignored.
 
@@ -58,9 +59,25 @@ The bot runs every 60 minutes (configurable) while the US market is open (9:30 A
 
 ---
 
+## Trading Modes
+
+Set `TRADING_MODE` in `.env` (or as an env var) to choose a risk profile. All risk parameters come from the selected mode's file in `modes/`. `MAX_DAILY_TRADES` and `MAX_WEEKLY_TRADES` can still be individually overridden via env vars.
+
+| Mode | Daily cap | Weekly cap | Positions | Stop-loss | Notional/trade | Description |
+|------|-----------|------------|-----------|-----------|----------------|-------------|
+| `conservative` | 1 | 3 | 2 | 7% | $50 | Low frequency, high conviction. Nest-egg building. |
+| `moderate` *(default)* | 3 | 8 | 4 | 5% | $75 | Balanced risk/reward. Reasonable activity. |
+| `aggressive` | 6 | 15 | 6 | 3% | $150 | High-frequency day trading. Maximize activity and size. |
+| `swing` | 2 | 5 | 3 | 8% | $100 | Ride multi-day trends with wide stops; let winners run. |
+| `dormant` | 0 | 0 | — | — | — | Analysis and alerts only. No orders are submitted. |
+
+Each mode also controls trailing-stop activation, ADX threshold, and other entry filters. See `modes/<name>.py` for the full parameter list.
+
+---
+
 ## Configuration
 
-Edit **`config.py`** to change:
+Edit **`config.py`** or set env vars to override individual settings. Risk parameters marked *(from mode)* default to whatever the selected `TRADING_MODE` specifies.
 
 | Variable | Default | Description |
 |----------|---------|--------------|
@@ -69,20 +86,20 @@ Edit **`config.py`** to change:
 | `DB_PATH` | MotherDuck | Requires `MOTHERDUCK_TOKEN` in `.env`; there is no local file fallback |
 | `TRENDS_RETAIN_DAYS` | `365` | Keep this many days of candle data; older rows are pruned each run |
 | `TRADE_LOG_RETAIN_DAYS` | `30` | Keep this many days of trade log; older rows pruned (weekly count needs 7+) |
-| `MAX_DAILY_TRADES` | `3` | Max new orders in rolling 24 hours |
-| `MAX_WEEKLY_TRADES` | `8` | Max new orders in rolling 7 days |
-| `MAX_OPEN_POSITIONS` | `4` | Max symbols held at once (no new BUY above this) |
-| `STOP_LOSS_PCT` | `0.05` | Sell if position is down 5% from average entry (e.g. `0.03` = 3%) |
+| `MAX_DAILY_TRADES` | *(from mode)* | Max new orders in rolling 24 hours (overridable via env var) |
+| `MAX_WEEKLY_TRADES` | *(from mode)* | Max new orders in rolling 7 days (overridable via env var) |
+| `MAX_OPEN_POSITIONS` | *(from mode)* | Max symbols held at once (no new BUY above this) |
+| `STOP_LOSS_PCT` | *(from mode)* | Sell if position is down this % from average entry |
 | `MAX_DAY_TRADES_IN_5_DAYS` | `3` | PDT: max day trades in a rolling 5 calendar-day window (stay under 4 to avoid PDT flag). SELLs that would be a day trade are blocked when at limit. |
-| `TRAIL_ACTIVATION_PCT` | `0.05` | Trailing stop activates when price is 5% above entry |
-| `TRAIL_PCT` | `0.04` | Once trailing stop is active, sell if price falls 4% from the running high since activation |
-| `ADX_STRONG_TREND_THRESHOLD` | `18` | Minimum ADX value to consider a trend strong enough to trade |
-| `NEAR_UPPER_BAND_TOLERANCE` | `0.025` | Treat price as "near upper band" when within 2.5% below the BB upper band |
-| `SIMILAR_TO_YESTERDAY_PCT` | `0.01` | Block entries when today's move vs prior close is less than 1% |
-| `RISK_PCT_PER_TRADE` | `0.01` | Risk this fraction of equity per trade (1%); set to `None` for fixed qty=1 |
-| `MAX_POSITION_PCT_EQUITY` | `0.10` | Cap position value at 10% of equity per symbol |
-| `MIN_SHARES` / `MAX_SHARES` | `1` / `100` | Clamp share count when using qty-based sizing (not notional) |
-| `NOTIONAL_PER_TRADE` | `75` | When set, each BUY is this many **dollars** (fractional shares); Alpaca min $1. Set to `None` for qty-based sizing. Good for small accounts (e.g. $50–$75 per trade). |
+| `TRAIL_ACTIVATION_PCT` | *(from mode)* | Trailing stop activates when price is this % above entry |
+| `TRAIL_PCT` | *(from mode)* | Once active, sell if price falls this % from the running high |
+| `ADX_STRONG_TREND_THRESHOLD` | *(from mode)* | Minimum ADX value to consider a trend strong enough to trade |
+| `NEAR_UPPER_BAND_TOLERANCE` | *(from mode)* | Treat price as "near upper band" when within this % below the BB upper band |
+| `SIMILAR_TO_YESTERDAY_PCT` | *(from mode)* | Block entries when today's move vs prior close is less than this % |
+| `RISK_PCT_PER_TRADE` | *(from mode)* | Risk this fraction of equity per trade; set to `None` for fixed qty=1 |
+| `MAX_POSITION_PCT_EQUITY` | *(from mode)* | Cap position value at this fraction of equity per symbol |
+| `MIN_SHARES` / `MAX_SHARES` | *(from mode)* | Clamp share count when using qty-based sizing (not notional) |
+| `NOTIONAL_PER_TRADE` | *(from mode)* | When set, each BUY is this many **dollars** (fractional shares); Alpaca min $1. Set to `None` for qty-based sizing. |
 
 ---
 
@@ -208,8 +225,10 @@ trading-bot/
 ├── backfill.py         # Historical candle backfill for backtesting
 ├── backtest.py         # Strategy backtest on historical data
 ├── report.py           # Monitoring report (account, positions, P&L, recent trades)
+├── dashboard.py        # FastAPI web dashboard (uvicorn dashboard:app --port 8080)
+├── dashboard.html      # Dashboard frontend (served by dashboard.py)
 ├── alerts.py           # Discord / email alerts on trades and errors
-├── config.py           # Symbols, intervals, risk and stop-loss settings
+├── config.py           # Symbols, intervals, mode loading, risk settings
 ├── data_fetch.py       # Providers → DuckDB (fetch_and_store, prune_old_trends)
 ├── data_providers.py   # Yahoo Finance + Finnhub candle/price fetchers with failover
 ├── analysis.py         # Indicators and signals (analyze_trends)
@@ -217,6 +236,12 @@ trading-bot/
 ├── signals.py          # FMP analyst upgrades/downgrades signal feed (fetch_signals)
 ├── migrations.py       # DB schema init and migrations
 ├── utils.py            # is_market_open(), logger
+├── modes/              # Trading mode parameter files (one per mode)
+│   ├── conservative.py
+│   ├── moderate.py
+│   ├── aggressive.py
+│   ├── swing.py
+│   └── dormant.py
 ├── requirements.txt
 ├── Dockerfile
 ├── .env.example        # Template for API keys
@@ -224,9 +249,14 @@ trading-bot/
 ├── logs/
 │   └── bot.log
 ├── tests/
-│   ├── helpers.py      # Spoofed OHLC and test DB helpers
-│   ├── test_analysis.py
-│   └── test_trading.py
+│   ├── conftest.py         # Env setup (sets dummy MOTHERDUCK_TOKEN + TRADING_MODE)
+│   ├── helpers.py          # Spoofed OHLC and test DB helpers
+│   ├── test_analysis.py    # analyze_trends signal logic
+│   ├── test_trading.py     # execute_trade buy/sell/stop-loss/trail logic
+│   ├── test_signal_trading.py  # execute_signal_buy / execute_signal_sell
+│   ├── test_pdt.py         # PDT day-trade counting and block logic
+│   ├── test_signals.py     # fetch_signals FMP filtering and deduplication
+│   └── test_modes.py       # Mode file completeness, invariants, and config loading
 ├── AGENTS.md           # Project memory and architecture (for AI/agents)
 └── README.md           # This file
 ```
@@ -243,7 +273,11 @@ python -m pytest tests/ -v
 ```
 
 - **`test_analysis.py`** — Downtrend produces no buy signal; insufficient data returns `None`; return dict has all keys trading expects.
-- **`test_trading.py`** — No order when analysis is missing or no strong trend; no BUY in downtrend; BUY when all conditions met; SELL when conditions met and position exists; no SELL when no position; stop-loss sells when price below threshold; no sell when above stop-loss threshold.
+- **`test_trading.py`** — No order when analysis is missing or no strong trend; no BUY in downtrend; BUY when all conditions met; SELL when conditions met and position exists; no SELL when no position; stop-loss sells when price below threshold; trailing stop activates and fires correctly.
+- **`test_signal_trading.py`** — `execute_signal_buy` respects daily/weekly/position caps, double-buy guard, notional sizing, and buying-power floor; `execute_signal_sell` enforces 24-hour hold, PDT guard, and position check.
+- **`test_pdt.py`** — `_count_day_trades_in_last_5_days` SQL/Python logic (empty log, buy-only, buy+sell same day, cross-day, 5-day window cutoff, partial close, multiple sells); `_would_sell_be_day_trade` and `_should_block_sell_pdt` gate logic. Uses a real temp DuckDB file.
+- **`test_signals.py`** — `fetch_signals` filtering: no API key, HTTP errors, non-list responses, all buy/sell action types, all grade strings, case-insensitive matching, wrong date, deduplication, and `publishedDate` fallback.
+- **`test_modes.py`** — Every mode file has all required keys with positive values; aggressive > moderate > conservative ordering of caps; swing trail is wider than all other modes; dormant blocks all trades; `config.py` loads the correct mode and rejects invalid ones; per-mode trading behavior (notional sizing, stop distances, trail activation).
 
 ---
 
