@@ -117,16 +117,17 @@ def fetch_daily_weekly_counts():
     con = duckdb.connect(DB_PATH)
     try:
         _ensure_trade_log(con)
-        now = time.time()
-        day_ago = now - 86400
-        week_ago = now - 7 * 86400
+        now_et = datetime.now(_ET)
+        midnight_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_start_ts = midnight_et.timestamp()
+        week_ago_ts = midnight_et.timestamp() - 7 * 86400
         daily = con.execute(
             f"SELECT COUNT(*) FROM {TRADE_LOG_TABLE} WHERE timestamp_utc >= ?",
-            [day_ago],
+            [day_start_ts],
         ).fetchone()[0]
         weekly = con.execute(
             f"SELECT COUNT(*) FROM {TRADE_LOG_TABLE} WHERE timestamp_utc >= ?",
-            [week_ago],
+            [week_ago_ts],
         ).fetchone()[0]
         return daily, weekly
     except Exception:

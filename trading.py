@@ -2,6 +2,8 @@
 import os
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
+import pytz
 import duckdb
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
@@ -115,15 +117,23 @@ def _record_trade(symbol: str, side: str, qty: float = 0) -> None:
         con.close()
 
 
+_ET = pytz.timezone("US/Eastern")
+
+
+def _today_et_start_ts() -> float:
+    """Unix timestamp of midnight ET today."""
+    now_et = datetime.now(_ET)
+    midnight_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight_et.timestamp()
+
+
 def _count_daily() -> int:
     con = duckdb.connect(DB_PATH)
     try:
         _ensure_trade_log(con)
-        now = time.time()
-        day_ago = now - 86400
         out = con.execute(
             f"SELECT COUNT(*) FROM {TRADE_LOG_TABLE} WHERE timestamp_utc >= ?",
-            [day_ago],
+            [_today_et_start_ts()],
         ).fetchone()
         return out[0] if out else 0
     except Exception as e:
