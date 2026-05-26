@@ -73,6 +73,17 @@ Set `TRADING_MODE` in `.env` (or as an env var) to choose a risk profile. All ri
 
 Each mode also controls trailing-stop activation, ADX threshold, and other entry filters. See `modes/<name>.py` for the full parameter list.
 
+**Safety defaults for missing keys**: `config.py` loads all critical risk parameters (ADX threshold, `STOP_LOSS_PCT`, `TRAIL_ACTIVATION_PCT`/`TRAIL_PCT`, `NOTIONAL_PER_TRADE`, etc.) defensively. If a mode file is ever missing a required key (e.g. from manual editing or a new custom mode), the bot falls back to conservative-leaning safe defaults:
+
+- `ADX_STRONG_TREND_THRESHOLD`: 22 (only strong trends)
+- `STOP_LOSS_PCT`: 7%, `TRAIL_ACTIVATION_PCT`: 10%, `TRAIL_PCT`: 6% (positions get room to breathe)
+- Trade caps and risk % are low
+- `NOTIONAL_PER_TRADE`: `None` (enables ATR-based risk sizing in `trading.py` instead of fixed tiny dollar amounts that amplify costs)
+
+A warning is logged at startup naming the exact missing key and file to fix. Aggressive mode gets extra validation (it refuses to start with certain catastrophic combinations and warns loudly on others). This guarantees that ADX, trail, and notional variables (and all other risk params) always have common-sense values — even if someone forgets to set them in a mode file — so the bot cannot silently disable stops or overtrade weak trends.
+
+All built-in modes (`conservative`, `moderate`, `aggressive`, `swing`, `dormant`) are complete; the fallbacks are a last-resort safety net, not a substitute for proper mode definitions. Tests in `tests/test_modes.py` enforce completeness and cover the fallback path.
+
 ---
 
 ## Configuration
@@ -99,7 +110,7 @@ Edit **`config.py`** or set env vars to override individual settings. Risk param
 | `RISK_PCT_PER_TRADE` | *(from mode)* | Risk this fraction of equity per trade; set to `None` for fixed qty=1 |
 | `MAX_POSITION_PCT_EQUITY` | *(from mode)* | Cap position value at this fraction of equity per symbol |
 | `MIN_SHARES` / `MAX_SHARES` | *(from mode)* | Clamp share count when using qty-based sizing (not notional) |
-| `NOTIONAL_PER_TRADE` | *(from mode)* | When set, each BUY is this many **dollars** (fractional shares); Alpaca min $1. Set to `None` for qty-based sizing. |
+| `NOTIONAL_PER_TRADE` | *(from mode)* | When set, each BUY is this many **dollars** (fractional shares); Alpaca min $1. Set to `None` for qty-based sizing. **Note:** `None` is the safer default for most users (enables ATR/risk-based position sizing). Fixed small notionals increase % transaction costs on round trips. |
 
 ---
 

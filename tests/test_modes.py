@@ -452,3 +452,108 @@ def test_conservative_notional_used_in_buy_order():
         order = mock_client.submit_order.call_args[0][0]
         assert order.side == OrderSide.BUY
         assert getattr(order, "notional", None) == 50.0
+
+
+# ─── 4. Defensive fallback behavior (missing mode keys) ─────────────────────────
+# These tests verify that config.py never lets critical risk variables
+# (ADX, trail params, NOTIONAL, etc.) become dangerous when a mode file
+# is missing a key. Safe conservative fallbacks + warnings protect the user.
+
+
+def test_missing_mode_key_uses_safe_fallback_adx():
+    """
+    If a mode's PARAMS is missing ADX_STRONG_TREND_THRESHOLD, config must
+    fall back to the safe conservative default (22) and still load without
+    crashing or using a catastrophic value (e.g. 0 or None).
+    """
+    import sys
+
+    os.environ["TRADING_MODE"] = "moderate"
+    os.environ.setdefault("MOTHERDUCK_TOKEN", "test-token")
+
+    mod = importlib.import_module("modes.moderate")
+    original = mod.PARAMS.copy()
+
+    try:
+        broken = original.copy()
+        broken.pop("ADX_STRONG_TREND_THRESHOLD", None)
+        mod.PARAMS = broken
+
+        # Force a clean load of config
+        if "config" in sys.modules:
+            del sys.modules["config"]
+        import config as cfg
+        cfg = importlib.reload(cfg)
+
+        # Safe fallback for ADX is 22 (see config._SAFE_FALLBACKS)
+        assert cfg.ADX_STRONG_TREND_THRESHOLD == 22
+    finally:
+        mod.PARAMS = original
+        if "config" in sys.modules:
+            del sys.modules["config"]
+
+
+def test_missing_mode_key_uses_safe_fallback_notional_and_trail():
+    """
+    Missing NOTIONAL_PER_TRADE falls back to None (enables ATR/risk-based
+    sizing in trading.py). Missing trail params also get safe defaults.
+    """
+    import sys
+
+    os.environ["TRADING_MODE"] = "moderate"
+    os.environ.setdefault("MOTHERDUCK_TOKEN", "test-token")
+
+    mod = importlib.import_module("modes.moderate")
+    original = mod.PARAMS.copy()
+
+    try:
+        broken = original.copy()
+        broken.pop("NOTIONAL_PER_TRADE", None)
+        broken.pop("TRAIL_ACTIVATION_PCT", None)
+        broken.pop("TRAIL_PCT", None)
+        mod.PARAMS = broken
+
+        if "config" in sys.modules:
+            del sys.modules["config"]
+        import config as cfg
+        cfg = importlib.reload(cfg)
+
+        assert cfg.NOTIONAL_PER_TRADE is None
+        # Safe trail fallbacks
+        assert cfg.TRAIL_ACTIVATION_PCT == 0.10
+        assert cfg.TRAIL_PCT == 0.06
+    finally:
+        mod.PARAMS = original
+        if "config" in sys.modules:
+            del sys.modules["config"]
+
+
+def test_broken_stop_loss_raises_on_validation():
+    """
+    If a critical protection value (STOP_LOSS_PCT) is present but <= 0,
+    the post-load validation in config.py must raise RuntimeError so the
+    bot cannot start in a state with disabled stops.
+    """
+    import sys
+
+    os.environ["TRADING_MODE"] = "moderate"
+    os.environ.setdefault("MOTHERDUCK_TOKEN", "test-token")
+
+    mod = importlib.import_module("modes.moderate")
+    original = mod.PARAMS.copy()
+
+    try:
+        broken = original.copy()
+        broken["STOP_LOSS_PCT"] = 0.0
+        mod.PARAMS = broken
+
+        if "config" in sys.modules:
+            del sys.modules["config"]
+
+        with pytest.raises(RuntimeError, match="Unsafe mode parameters"):
+            import config as cfg
+            importlib.reload(cfg)
+    finally:
+        mod.PARAMS = original
+        if "config" in sys.modules:
+            del sys.modules["config"]

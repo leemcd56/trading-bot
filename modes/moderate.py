@@ -5,6 +5,12 @@
 #   - Standard daily/weekly trade caps keep activity meaningful but not frenetic.
 #   - 5% stop-loss / 5% trail activation is a tried-and-true baseline for daily candles.
 #   - Per-trade sizing at 1% equity keeps drawdowns manageable across a losing streak.
+#
+# SAFETY NOTE: All keys below are required. If any are missing at runtime,
+# config.py supplies conservative fallbacks (high ADX, wide stops, NOTIONAL=None,
+# low caps) + a startup warning. This prevents a broken mode file from
+# silently disabling protection or using dangerous values (e.g. ADX=0 or
+# stops disabled). Keep this file complete.
 
 PARAMS = {
     # Trade frequency caps

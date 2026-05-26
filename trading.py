@@ -132,7 +132,7 @@ def _count_daily() -> int:
     try:
         _ensure_trade_log(con)
         out = con.execute(
-            f"SELECT COUNT(*) FROM {TRADE_LOG_TABLE} WHERE timestamp_utc >= ?",
+            f"SELECT COUNT(*) FROM {TRADE_LOG_TABLE} WHERE timestamp_utc >= ? AND side = 'BUY'",
             [_today_et_start_ts()],
         ).fetchone()
         return out[0] if out else 0
@@ -150,7 +150,7 @@ def _count_weekly() -> int:
         now = time.time()
         week_ago = now - 7 * 86400
         out = con.execute(
-            f"SELECT COUNT(*) FROM {TRADE_LOG_TABLE} WHERE timestamp_utc >= ?",
+            f"SELECT COUNT(*) FROM {TRADE_LOG_TABLE} WHERE timestamp_utc >= ? AND side = 'BUY'",
             [week_ago],
         ).fetchone()
         return out[0] if out else 0

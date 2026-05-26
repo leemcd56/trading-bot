@@ -9,6 +9,11 @@
 #
 # WARNING: aggressive mode carries significantly higher drawdown risk.  Suitable only
 # for capital you can afford to lose and accounts not subject to PDT restrictions.
+#
+# SAFETY NOTE: All keys below are required. If any are missing at runtime,
+# config.py supplies conservative fallbacks (high ADX, wide stops, NOTIONAL=None,
+# low caps) + a startup warning. This prevents a broken aggressive mode file
+# from becoming even more dangerous. Keep this file complete.
 
 PARAMS = {
     # Trade frequency caps

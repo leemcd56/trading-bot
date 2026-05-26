@@ -122,11 +122,11 @@ def fetch_daily_weekly_counts():
         day_start_ts = midnight_et.timestamp()
         week_ago_ts = midnight_et.timestamp() - 7 * 86400
         daily = con.execute(
-            f"SELECT COUNT(*) FROM {TRADE_LOG_TABLE} WHERE timestamp_utc >= ?",
+            f"SELECT COUNT(*) FROM {TRADE_LOG_TABLE} WHERE timestamp_utc >= ? AND side = 'BUY'",
             [day_start_ts],
         ).fetchone()[0]
         weekly = con.execute(
-            f"SELECT COUNT(*) FROM {TRADE_LOG_TABLE} WHERE timestamp_utc >= ?",
+            f"SELECT COUNT(*) FROM {TRADE_LOG_TABLE} WHERE timestamp_utc >= ? AND side = 'BUY'",
             [week_ago_ts],
         ).fetchone()[0]
         return daily, weekly
