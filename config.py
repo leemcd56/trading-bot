@@ -1,8 +1,11 @@
 import os
 import importlib
+import logging
 from dotenv import load_dotenv
 
 load_dotenv()
+
+_log = logging.getLogger(__name__)
 
 _symbols_env = os.getenv("WATCH_SYMBOLS", "")
 SYMBOLS = (
@@ -52,27 +55,145 @@ if TRADING_MODE not in _VALID_MODES:
 
 _mode = importlib.import_module(f"modes.{TRADING_MODE}").PARAMS
 
+# ─── Safe fallback defaults (defensive loading) ──────────────────────────────────
+# These are used ONLY when a mode file is missing a required key.
+# They are deliberately conservative-leaning so that a missing or incomplete
+# mode definition cannot silently cause dangerous behavior (especially in
+# aggressive mode). Built-in mode files are expected to be complete (tests
+# enforce this), but the fallbacks protect against manual edits, new modes,
+# or accidental deletions.
+#
+# Common-sense philosophy for fallbacks:
+#   - High ADX bar (prefer missing trades over bad ones)
+#   - Wider stops / later trail activation (give positions room)
+#   - Low trade frequency caps
+#   - Small risk per trade
+#   - NOTIONAL_PER_TRADE=None → enables ATR-based risk sizing in trading.py
+#     (fixed small notionals like $75 amplify % costs on round trips)
+_SAFE_FALLBACKS = {
+    # Trade frequency caps — conservative activity
+    "MAX_DAILY_TRADES": 1,
+    "MAX_WEEKLY_TRADES": 3,
+    "MAX_OPEN_POSITIONS": 2,
+
+    # Stop-loss / trailing stop — give positions breathing room
+    "STOP_LOSS_PCT": 0.07,
+    "TRAIL_ACTIVATION_PCT": 0.10,
+    "TRAIL_PCT": 0.06,
+
+    # Entry gate strictness — only strong, confirmed trends
+    "ADX_STRONG_TREND_THRESHOLD": 22,
+    "NEAR_UPPER_BAND_TOLERANCE": 0.02,
+    "SIMILAR_TO_YESTERDAY_PCT": 0.015,
+
+    # Position sizing — small risk; prefer ATR-based over fixed tiny notionals
+    "RISK_PCT_PER_TRADE": 0.005,
+    "MAX_POSITION_PCT_EQUITY": 0.08,
+    "MIN_SHARES": 1,
+    "MAX_SHARES": 100,
+    "NOTIONAL_PER_TRADE": None,  # None = use risk/ATR sizing (safer default)
+}
+
+
+def _mode_get(key: str):
+    """
+    Return a value from the selected mode's PARAMS.
+    Falls back to a safe conservative default + warning if the key is missing.
+    This guarantees that ADX, trail params, NOTIONAL_PER_TRADE, and all other
+    critical risk variables always have common-sense values even if a mode
+    file is incomplete.
+    """
+    if key in _mode:
+        return _mode[key]
+    default = _SAFE_FALLBACKS.get(key)
+    _log.warning(
+        "TRADING_MODE=%s PARAMS is missing key '%s'. "
+        "Using safe conservative fallback: %s. "
+        "Fix this in modes/%s.py (every mode must export all keys listed in "
+        "tests/test_modes.py REQUIRED_KEYS).",
+        TRADING_MODE, key, default, TRADING_MODE
+    )
+    return default
+
+
 # ─── Risk limits ─────────────────────────────────────────────────────────────────
 # MAX_DAILY_TRADES and MAX_WEEKLY_TRADES can be overridden via env vars; all others
-# come directly from the selected mode.
+# come from the selected mode (with safe fallbacks if a key is absent).
 
-MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", str(_mode["MAX_DAILY_TRADES"])))
-MAX_WEEKLY_TRADES = int(os.getenv("MAX_WEEKLY_TRADES", str(_mode["MAX_WEEKLY_TRADES"])))
-MAX_OPEN_POSITIONS = _mode["MAX_OPEN_POSITIONS"]
+_daily_default = _mode_get("MAX_DAILY_TRADES")
+_weekly_default = _mode_get("MAX_WEEKLY_TRADES")
+MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", str(_daily_default)))
+MAX_WEEKLY_TRADES = int(os.getenv("MAX_WEEKLY_TRADES", str(_weekly_default)))
+MAX_OPEN_POSITIONS = _mode_get("MAX_OPEN_POSITIONS")
 
 # Stop-loss / trailing stop
-STOP_LOSS_PCT = _mode["STOP_LOSS_PCT"]
-TRAIL_ACTIVATION_PCT = _mode["TRAIL_ACTIVATION_PCT"]
-TRAIL_PCT = _mode["TRAIL_PCT"]
+STOP_LOSS_PCT = _mode_get("STOP_LOSS_PCT")
+TRAIL_ACTIVATION_PCT = _mode_get("TRAIL_ACTIVATION_PCT")
+TRAIL_PCT = _mode_get("TRAIL_PCT")
 
 # Position sizing
-RISK_PCT_PER_TRADE = _mode["RISK_PCT_PER_TRADE"]
-MAX_POSITION_PCT_EQUITY = _mode["MAX_POSITION_PCT_EQUITY"]
-MIN_SHARES = _mode["MIN_SHARES"]
-MAX_SHARES = _mode["MAX_SHARES"]
-NOTIONAL_PER_TRADE = _mode["NOTIONAL_PER_TRADE"]
+RISK_PCT_PER_TRADE = _mode_get("RISK_PCT_PER_TRADE")
+MAX_POSITION_PCT_EQUITY = _mode_get("MAX_POSITION_PCT_EQUITY")
+MIN_SHARES = _mode_get("MIN_SHARES")
+MAX_SHARES = _mode_get("MAX_SHARES")
+NOTIONAL_PER_TRADE = _mode_get("NOTIONAL_PER_TRADE")
 
 # Entry filters
-ADX_STRONG_TREND_THRESHOLD = _mode["ADX_STRONG_TREND_THRESHOLD"]
-NEAR_UPPER_BAND_TOLERANCE = _mode["NEAR_UPPER_BAND_TOLERANCE"]
-SIMILAR_TO_YESTERDAY_PCT = _mode["SIMILAR_TO_YESTERDAY_PCT"]
+ADX_STRONG_TREND_THRESHOLD = _mode_get("ADX_STRONG_TREND_THRESHOLD")
+NEAR_UPPER_BAND_TOLERANCE = _mode_get("NEAR_UPPER_BAND_TOLERANCE")
+SIMILAR_TO_YESTERDAY_PCT = _mode_get("SIMILAR_TO_YESTERDAY_PCT")
+
+
+# ─── Post-load validation (catches broken or reckless combinations) ─────────────
+def _validate_mode_params() -> None:
+    """
+    After loading, validate critical risk parameters.
+    Warns on risky-but-usable values; raises on values that would disable
+    protection or produce clearly broken behavior.
+    Aggressive mode gets extra scrutiny because its explicit values are
+    already high-risk; missing keys must never make it worse.
+    """
+    problems = []
+
+    # ADX too low → admits noise and weak trends
+    if ADX_STRONG_TREND_THRESHOLD is not None and ADX_STRONG_TREND_THRESHOLD < 10:
+        problems.append(f"ADX_STRONG_TREND_THRESHOLD={ADX_STRONG_TREND_THRESHOLD} is extremely low (<10)")
+
+    # Stops/trails disabled or broken
+    if STOP_LOSS_PCT is not None and STOP_LOSS_PCT <= 0:
+        problems.append("STOP_LOSS_PCT <= 0 — stop-losses are disabled!")
+    if TRAIL_PCT is not None and TRAIL_PCT <= 0:
+        problems.append("TRAIL_PCT <= 0 — trailing stops are disabled!")
+
+    # Insane risk sizing
+    if RISK_PCT_PER_TRADE is not None and RISK_PCT_PER_TRADE > 0.10:
+        problems.append(f"RISK_PCT_PER_TRADE={RISK_PCT_PER_TRADE} (>10% per trade) is extremely aggressive")
+
+    # Nonsensical caps
+    if MAX_DAILY_TRADES < 0 or MAX_WEEKLY_TRADES < 0 or MAX_OPEN_POSITIONS < 0:
+        problems.append("Negative trade/position caps are invalid")
+
+    # Aggressive-specific warnings (only when the mode is explicitly aggressive)
+    if TRADING_MODE == "aggressive":
+        if ADX_STRONG_TREND_THRESHOLD is not None and ADX_STRONG_TREND_THRESHOLD < 12:
+            problems.append(
+                "aggressive mode with ADX < 12 — this will overtrade weak/choppy trends; "
+                "consider raising ADX_STRONG_TREND_THRESHOLD in modes/aggressive.py"
+            )
+        if NOTIONAL_PER_TRADE is not None and NOTIONAL_PER_TRADE > 1000:
+            problems.append(
+                f"aggressive NOTIONAL_PER_TRADE=${NOTIONAL_PER_TRADE} is very large; "
+                "monitor drawdowns closely"
+            )
+
+    if problems:
+        msg = "; ".join(problems)
+        _log.error("Mode safety problems for TRADING_MODE=%s: %s", TRADING_MODE, msg)
+        # Hard-fail only on truly catastrophic (protection disabled or invalid caps)
+        if any("disabled" in p.lower() or "negative" in p.lower() for p in problems):
+            raise RuntimeError(f"Unsafe mode parameters detected: {msg}")
+        # Otherwise just warn; operator can decide to proceed
+        _log.warning("Proceeding with risky parameters. Monitor performance closely.")
+
+
+_validate_mode_params()
