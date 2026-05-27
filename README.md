@@ -107,6 +107,9 @@ Edit **`config.py`** or set env vars to override individual settings. Risk param
 | `ADX_STRONG_TREND_THRESHOLD` | *(from mode)* | Minimum ADX value to consider a trend strong enough to trade |
 | `NEAR_UPPER_BAND_TOLERANCE` | *(from mode)* | Treat price as "near upper band" when within this % below the BB upper band |
 | `SIMILAR_TO_YESTERDAY_PCT` | *(from mode)* | Block entries when today's move vs prior close is less than this % |
+| `REQUIRE_ADX_RISING` | *(from mode)* | Require current ADX > ADX 5 bars ago (trend must be strengthening — very effective daily filter) |
+| `REQUIRE_VOLUME_CONFIRMATION` | *(from mode)* | Require current volume > 20-day SMA volume (breakouts/continuations on real participation) |
+| `LONG_TERM_SMA_PERIOD` | *(from mode)* | Require price above this SMA period for long-term trend bias (0 = disabled). Conservative 200, moderate 100, aggressive off |
 | `RISK_PCT_PER_TRADE` | *(from mode)* | Risk this fraction of equity per trade; set to `None` for fixed qty=1 |
 | `MAX_POSITION_PCT_EQUITY` | *(from mode)* | Cap position value at this fraction of equity per symbol |
 | `MIN_SHARES` / `MAX_SHARES` | *(from mode)* | Clamp share count when using qty-based sizing (not notional) |
@@ -149,7 +152,14 @@ Edit **`config.py`** or set env vars to override individual settings. Risk param
 - **Extended decline** (`extended_decline`): Price is still more than 7% below the 50-bar high. Indicates we’re in a drawdown; avoids catching a falling knife.
 - **Volatility spike** (`volatility_spike`): Current ATR(14) is more than 1.5× the ATR from the prior 14-bar window. Entering when volatility has just spiked is risky.
 
-**Signals returned (examples):** `strong_trend`, `uptrend`, `sar_below_price`, `sar_above_price`, `near_upper_band`, `near_lower_band`, `bb_squeeze`, `bullish_crossover`, `bearish_crossover`, `sar_flipped_to_bull`, `sar_flipped_to_bear`, `trending_up_a_lot`, `similar_to_yesterday`, `dive_bombing`, `dead_cat_bounce`, `extended_decline`, `volatility_spike`, `avoid_long`, `current_price`.
+**Daily-bar compensating filters** (new, mode-driven): To make moderate and aggressive viable on daily candles, the bot now also computes three highly effective daily-specific filters whose requirements are controlled by the selected mode:
+- `adx_rising` — current ADX > ADX 5 bars ago (trend is strengthening).
+- `volume_confirmed` — current volume > 20-day SMA of volume.
+- `above_long_term_ma` — price > SMA(LONG_TERM_SMA_PERIOD) when that period is > 0.
+
+Conservative and swing require all three; moderate requires them with a 100-day SMA; aggressive keeps only ADX rising (the single highest-ROI daily filter) and relaxes the others. These are the main "compensating filters" that prevent aggressive from simply overtrading noise on daily bars.
+
+**Signals returned (examples):** `strong_trend`, `uptrend`, `sar_below_price`, `sar_above_price`, `near_upper_band`, `near_lower_band`, `bb_squeeze`, `bullish_crossover`, `bearish_crossover`, `sar_flipped_to_bull`, `sar_flipped_to_bear`, `trending_up_a_lot`, `similar_to_yesterday`, `dive_bombing`, `dead_cat_bounce`, `extended_decline`, `volatility_spike`, `avoid_long`, `current_price`, `adx_rising`, `volume_confirmed`, `above_long_term_ma`.
 
 **Data quality:** If the latest bar is older than 7 days (production only; allows for weekends and provider delays), analysis returns `None` so the bot doesn’t trade on stale data.
 

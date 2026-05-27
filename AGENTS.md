@@ -52,16 +52,22 @@ trading-bot/
 
 ## Current Entry / Exit Logic Summary
 
-**Buy (Long) Condition** (all must be true)
+**Buy (Long) Condition** (many gates are now mode-dependent via the selected TRADING_MODE)
 
-- Strong trend: `ADX > 25`
+- Strong trend: `ADX > ADX_STRONG_TREND_THRESHOLD` (25 conservative, 18 moderate, 14 aggressive)
 - Uptrend direction: `+DI > -DI`
 - Price above Parabolic SAR (`sar_below_price`)
-- Price above BB middle band + near/touching upper band
-- Fresh bullish signal: `bullish_crossover` **or** `sar_flipped_to_bull`
-- Momentum: `MACD > signal`, `RSI > 55`, `close > SMA_50`
-- Not similar to yesterday (`abs(change) ≥ 2%`)
-- No BB squeeze (avoid low-vol entries)
+- (Optional, conservative only) Price above BB middle band + near/touching upper band (`REQUIRE_NEAR_UPPER_BAND`)
+- (Optional) Fresh bullish signal: `bullish_crossover` **or** `sar_flipped_to_bull` (`REQUIRE_BULLISH_TRIGGER`)
+- Momentum: `MACD > signal`, `RSI > RSI_ENTRY_THRESHOLD` (55/50/45 depending on mode)
+- Not similar to yesterday (threshold from mode)
+- No BB squeeze (threshold from mode)
+- **Daily compensating filters** (new, the main addition to make aggressive viable on daily bars):
+  - `REQUIRE_ADX_RISING`: current ADX > ADX 5 bars ago (trend strengthening)
+  - `REQUIRE_VOLUME_CONFIRMATION`: current volume > 20-day SMA volume
+  - `LONG_TERM_SMA_PERIOD`: price > SMA(N) when N > 0 (major trend bias)
+
+Conservative/swing use the strictest combination of the above. Moderate is balanced. Aggressive keeps only ADX rising as a minimal daily guardrail and relaxes the rest.
 
 **Sell / Exit Condition** (any true → consider exit)
 

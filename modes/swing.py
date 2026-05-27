@@ -6,6 +6,8 @@
 #   - Wide stop-loss (8%) and trailing stop (activates at +15%, retreats 8%) prevent being
 #     shaken out by routine daily noise while still protecting against real reversals.
 #   - Larger notional per trade since fewer, higher-conviction positions are taken.
+#   - Wants reasonably clean entries for longer holds: requires a fresh trigger, but does
+#     not demand upper-band extension.
 
 PARAMS = {
     # Trade frequency caps
@@ -20,10 +22,19 @@ PARAMS = {
     "TRAIL_ACTIVATION_PCT": 0.15, # trailing stop arms only after a 15% gain (let it run)
     "TRAIL_PCT": 0.08,            # once armed, sell if price falls 8% from running high
 
-    # Entry gate strictness
+    # Entry gate strictness (clean setups for multi-day holds)
     "ADX_STRONG_TREND_THRESHOLD": 20,   # slightly above moderate — want a clear trend
     "NEAR_UPPER_BAND_TOLERANCE": 0.02,  # within 2% of BB upper band counts as extended
     "SIMILAR_TO_YESTERDAY_PCT": 0.01,   # skip if day's move vs prior close < 1%
+    "RSI_ENTRY_THRESHOLD": 48,          # RSI > 48 — solid but not extreme momentum for swing
+    "REQUIRE_BULLISH_TRIGGER": True,    # wants a discrete fresh signal (crossover or SAR flip) for longer holds
+    "BB_SQUEEZE_MAX_WIDTH_PCT": 0.04,   # standard squeeze avoidance
+    "REQUIRE_NEAR_UPPER_BAND": False,   # does not require upper-band extension (enters earlier in the move)
+
+    # Daily-bar compensating filters (swing wants clean, high-quality setups for multi-day holds)
+    "REQUIRE_ADX_RISING": True,         # trend must be strengthening
+    "REQUIRE_VOLUME_CONFIRMATION": True, # volume confirmation helps on daily swing entries
+    "LONG_TERM_SMA_PERIOD": 200,        # strong major-trend alignment for longer holds
 
     # Position sizing
     "RISK_PCT_PER_TRADE": 0.015,        # risk 1.5% of equity per trade

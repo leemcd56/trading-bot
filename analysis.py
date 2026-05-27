@@ -4,7 +4,17 @@ import duckdb
 import pandas as pd
 import talib
 import numpy as np
-from config import DB_PATH, NEAR_UPPER_BAND_TOLERANCE, SIMILAR_TO_YESTERDAY_PCT, ADX_STRONG_TREND_THRESHOLD
+from config import (
+    DB_PATH,
+    NEAR_UPPER_BAND_TOLERANCE,
+    SIMILAR_TO_YESTERDAY_PCT,
+    ADX_STRONG_TREND_THRESHOLD,
+    RSI_ENTRY_THRESHOLD,
+    BB_SQUEEZE_MAX_WIDTH_PCT,
+    REQUIRE_ADX_RISING,
+    REQUIRE_VOLUME_CONFIRMATION,
+    LONG_TERM_SMA_PERIOD,
+)
 from data_providers import get_intraday_price, get_daily_candles_with_failover
 from utils import logger
 
@@ -48,7 +58,7 @@ def _analyze_df(symbol: str, df: pd.DataFrame, use_staleness_check: bool) -> dic
             pass
 
     # Ensure numeric columns
-    for col in ["high", "low", "close"]:
+    for col in ["high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     # Bollinger Bands
@@ -256,6 +266,31 @@ def _analyze_df(symbol: str, df: pd.DataFrame, use_staleness_check: bool) -> dic
 
     avoid_long = dead_cat_bounce or extended_decline or volatility_spike
 
+    # ─── Daily-bar compensating filters (highly effective on daily candles) ───
+    # These are the "compensating filters" that make aggressive (and moderate) viable on daily data.
+
+    adx_rising = False
+    if len(df) >= 6 and "ADX" in df.columns:
+        adx_now = latest.get("ADX") if hasattr(latest, "get") else latest["ADX"]
+        adx_ago = df["ADX"].iloc[-6]  # 5 bars ago
+        if _ok(adx_now) and _ok(adx_ago):
+            adx_rising = float(adx_now) > float(adx_ago)
+
+    volume_confirmed = False
+    if len(df) >= 20 and "volume" in df.columns:
+        df["VOL_SMA20"] = talib.SMA(df["volume"].values, timeperiod=20)
+        vol_now = latest.get("volume") if hasattr(latest, "get") else latest["volume"]
+        vol_sma = df["VOL_SMA20"].iloc[-1]
+        if _ok(vol_now) and _ok(vol_sma) and float(vol_sma) > 0:
+            volume_confirmed = float(vol_now) > float(vol_sma)
+
+    above_long_term_ma = True  # disabled (period=0) never blocks
+    if LONG_TERM_SMA_PERIOD and LONG_TERM_SMA_PERIOD > 0 and len(df) >= LONG_TERM_SMA_PERIOD:
+        df["SMA_LT"] = talib.SMA(df["close"].values, timeperiod=int(LONG_TERM_SMA_PERIOD))
+        sma_lt = df["SMA_LT"].iloc[-1]
+        if _ok(sma_lt):
+            above_long_term_ma = close > float(sma_lt)
+
     # ATR for position sizing (stop distance)
     atr_14 = latest.get("ATR_14") if "ATR_14" in df.columns else None
     atr_14_float = float(atr_14) if _ok(atr_14) else None
@@ -287,6 +322,10 @@ def _analyze_df(symbol: str, df: pd.DataFrame, use_staleness_check: bool) -> dic
         "avoid_long": avoid_long,
         "current_price": current_price,
         "atr_14": atr_14_float,
+        # New daily-bar compensating filter flags
+        "adx_rising": adx_rising,
+        "volume_confirmed": volume_confirmed,
+        "above_long_term_ma": above_long_term_ma,
     }
 
 
