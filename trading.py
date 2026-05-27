@@ -28,6 +28,11 @@ from config import (
     MAX_DAY_TRADES_IN_5_DAYS,
     TRAIL_ACTIVATION_PCT,
     TRAIL_PCT,
+    REQUIRE_BULLISH_TRIGGER,
+    REQUIRE_NEAR_UPPER_BAND,
+    REQUIRE_ADX_RISING,
+    REQUIRE_VOLUME_CONFIRMATION,
+    LONG_TERM_SMA_PERIOD,
 )
 
 load_dotenv()
@@ -356,12 +361,21 @@ def _skip_reasons_buy(analysis: dict) -> list[str]:
         or analysis.get('bullish_crossover_recent')
         or analysis.get('sar_flipped_to_bull_recent')
     )
-    if not bullish_trigger:
+    # Only treat missing trigger as a blocker when the current mode requires it
+    if REQUIRE_BULLISH_TRIGGER and not bullish_trigger:
         reasons.append("no_bullish_crossover_or_sar_flip")
     if analysis.get('similar_to_yesterday'):
         reasons.append("similar_to_yesterday=True")
     if analysis.get('bb_squeeze'):
         reasons.append("bb_squeeze=True")
+    if REQUIRE_NEAR_UPPER_BAND and not analysis.get('near_upper_band'):
+        reasons.append("near_upper_band=False")
+    if REQUIRE_ADX_RISING and not analysis.get('adx_rising'):
+        reasons.append("adx_rising=False")
+    if REQUIRE_VOLUME_CONFIRMATION and not analysis.get('volume_confirmed'):
+        reasons.append("volume_confirmed=False")
+    if LONG_TERM_SMA_PERIOD and LONG_TERM_SMA_PERIOD > 0 and not analysis.get('above_long_term_ma'):
+        reasons.append("above_long_term_ma=False")
     if analysis.get('avoid_long'):
         sub = []
         if analysis.get('dead_cat_bounce'):
@@ -385,11 +399,24 @@ def _buy_gate_scorecard(analysis: dict) -> str:
     gates = [
         ("trend", bool(analysis.get('trending_up_a_lot'))),
         ("sar", bool(analysis.get('sar_below_price'))),
-        ("trigger", bool(bullish_trigger)),
+    ]
+    # Conditionally include gates that the current mode actually enforces
+    if REQUIRE_BULLISH_TRIGGER:
+        gates.append(("trigger", bool(bullish_trigger)))
+    if REQUIRE_NEAR_UPPER_BAND:
+        gates.append(("nearBB", bool(analysis.get('near_upper_band'))))
+    # New daily compensating filters (shown only when the mode actually requires them)
+    if REQUIRE_ADX_RISING:
+        gates.append(("adxUp", bool(analysis.get('adx_rising'))))
+    if REQUIRE_VOLUME_CONFIRMATION:
+        gates.append(("volOK", bool(analysis.get('volume_confirmed'))))
+    if LONG_TERM_SMA_PERIOD and LONG_TERM_SMA_PERIOD > 0:
+        gates.append(("LTma", bool(analysis.get('above_long_term_ma'))))
+    gates.extend([
         ("!similar", not bool(analysis.get('similar_to_yesterday', False))),
         ("!squeeze", not bool(analysis.get('bb_squeeze', False))),
         ("!avoid", not bool(analysis.get('avoid_long', False))),
-    ]
+    ])
     return " ".join([f"{name}={'Y' if ok else 'N'}" for name, ok in gates])
 
 
@@ -485,14 +512,30 @@ def execute_trade(symbol: str, analysis: dict | None):
         or analysis.get('sar_flipped_to_bull_recent', False)
     )
 
-    if (
+    # Core BUY decision — many gates are now mode-dependent.
+    # The daily compensating filters (adx_rising, volume_confirmed, above_long_term_ma)
+    # are the main new guardrails that make aggressive viable on daily bars.
+    core_ok = (
         analysis.get('trending_up_a_lot') and
         analysis.get('sar_below_price') and
-        bullish_trigger and
         not analysis.get('similar_to_yesterday', False) and
         not analysis.get('bb_squeeze', False) and
         not analysis.get('avoid_long', False)
-    ):
+    )
+    if REQUIRE_BULLISH_TRIGGER:
+        core_ok = core_ok and bool(bullish_trigger)
+    if REQUIRE_NEAR_UPPER_BAND:
+        core_ok = core_ok and bool(analysis.get('near_upper_band'))
+
+    # New daily-bar compensating filters (the key request for fixing aggressive on daily data)
+    if REQUIRE_ADX_RISING:
+        core_ok = core_ok and bool(analysis.get('adx_rising'))
+    if REQUIRE_VOLUME_CONFIRMATION:
+        core_ok = core_ok and bool(analysis.get('volume_confirmed'))
+    if LONG_TERM_SMA_PERIOD and LONG_TERM_SMA_PERIOD > 0:
+        core_ok = core_ok and bool(analysis.get('above_long_term_ma'))
+
+    if core_ok:
         if _open_positions_count() >= MAX_OPEN_POSITIONS:
             logger.warning(f"{symbol}: Skipping BUY - max open positions ({MAX_OPEN_POSITIONS})")
             return

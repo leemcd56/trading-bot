@@ -88,6 +88,10 @@ def test_all_buy_conditions_submits_buy():
             "similar_to_yesterday": False,
             "bb_squeeze": False,
             "avoid_long": False,
+            # New daily compensating filter flags (required by the current mode defaults in the BUY gate)
+            "adx_rising": True,
+            "volume_confirmed": True,
+            "above_long_term_ma": True,
         }
         trading.execute_trade("TEST", analysis)
         mock_client.submit_order.assert_called_once()
@@ -112,6 +116,10 @@ def test_recent_bullish_signal_can_submit_buy():
             "similar_to_yesterday": False,
             "bb_squeeze": False,
             "avoid_long": False,
+            # New daily compensating filter flags
+            "adx_rising": True,
+            "volume_confirmed": True,
+            "above_long_term_ma": True,
         }
         trading.execute_trade("TEST", analysis)
         mock_client.submit_order.assert_called_once()
@@ -227,7 +235,9 @@ def test_stop_loss_does_not_sell_when_above_threshold():
 
 
 def _buy_conditions_for_notional():
-    """Analysis dict that satisfies all BUY conditions (for notional/whole-share tests)."""
+    """Analysis dict that satisfies all BUY conditions (for notional/whole-share tests).
+    Includes the new daily compensating filter flags so the tests pass with the current mode defaults.
+    """
     return {
         "strong_trend": True,
         "uptrend": True,
@@ -239,6 +249,10 @@ def _buy_conditions_for_notional():
         "similar_to_yesterday": False,
         "bb_squeeze": False,
         "avoid_long": False,
+        # New daily compensating filters (required by aggressive and some other modes by default)
+        "adx_rising": True,
+        "volume_confirmed": True,
+        "above_long_term_ma": True,
     }
 
 

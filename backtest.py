@@ -14,6 +14,11 @@ from config import (
     MAX_WEEKLY_TRADES,
     MAX_OPEN_POSITIONS,
     STOP_LOSS_PCT,
+    REQUIRE_BULLISH_TRIGGER,
+    REQUIRE_NEAR_UPPER_BAND,
+    REQUIRE_ADX_RISING,
+    REQUIRE_VOLUME_CONFIRMATION,
+    LONG_TERM_SMA_PERIOD,
 )
 from analysis import analyze_trends
 from utils import logger
@@ -187,15 +192,28 @@ def run_backtest(
                 or ana.get("bullish_crossover_recent", False)
                 or ana.get("sar_flipped_to_bull_recent", False)
             )
-            buy = (
+            # Align with live trading.py: make trigger and near-upper-band conditional on mode
+            core_ok = (
                 ana.get("trending_up_a_lot")
-                and ana.get("near_upper_band")
                 and ana.get("sar_below_price")
-                and bullish_trigger
                 and not ana.get("similar_to_yesterday", False)
                 and not ana.get("bb_squeeze", False)
                 and not ana.get("avoid_long", False)
             )
+            if REQUIRE_BULLISH_TRIGGER:
+                core_ok = core_ok and bool(bullish_trigger)
+            if REQUIRE_NEAR_UPPER_BAND:
+                core_ok = core_ok and bool(ana.get("near_upper_band"))
+
+            # New daily compensating filters (must match live trading.py logic)
+            if REQUIRE_ADX_RISING:
+                core_ok = core_ok and bool(ana.get("adx_rising"))
+            if REQUIRE_VOLUME_CONFIRMATION:
+                core_ok = core_ok and bool(ana.get("volume_confirmed"))
+            if LONG_TERM_SMA_PERIOD and LONG_TERM_SMA_PERIOD > 0:
+                core_ok = core_ok and bool(ana.get("above_long_term_ma"))
+
+            buy = core_ok
             if buy:
                 price = current_prices[symbol]
                 qty = 1  # fixed for backtest; position sizing is separate

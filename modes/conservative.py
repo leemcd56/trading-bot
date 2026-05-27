@@ -6,6 +6,8 @@
 #   - Wider initial stop gives positions room to breathe without being shaken out.
 #   - Trailing stop activates only after a meaningful gain, then locks in profits tightly.
 #   - Tight open-position cap keeps concentration risk low.
+#   - Strict entry filters: higher RSI floor, mandatory fresh trigger (crossover or SAR flip),
+#     and requires price to be near the upper Bollinger Band for conviction.
 
 PARAMS = {
     # Trade frequency caps
@@ -20,10 +22,19 @@ PARAMS = {
     "TRAIL_ACTIVATION_PCT": 0.10, # trailing stop arms once price is 10% above entry
     "TRAIL_PCT": 0.05,            # once armed, sell if price falls 5% from running high
 
-    # Entry gate strictness
+    # Entry gate strictness (high-conviction only)
     "ADX_STRONG_TREND_THRESHOLD": 25,   # classic "strong trend" ADX cutoff
     "NEAR_UPPER_BAND_TOLERANCE": 0.015, # within 1.5% of BB upper band counts as extended
     "SIMILAR_TO_YESTERDAY_PCT": 0.02,   # skip if day's move vs prior close < 2%
+    "RSI_ENTRY_THRESHOLD": 55,          # RSI > 55 for strong bullish momentum
+    "REQUIRE_BULLISH_TRIGGER": True,    # require a fresh crossover or SAR flip for entry
+    "BB_SQUEEZE_MAX_WIDTH_PCT": 0.05,   # higher threshold = stricter squeeze avoidance (blocks more compressed-vol situations)
+    "REQUIRE_NEAR_UPPER_BAND": True,    # require price to be extended near upper band for high-conviction entries
+
+    # Daily-bar compensating filters (effective on daily candles; conservative keeps them strict)
+    "REQUIRE_ADX_RISING": True,         # ADX today > ADX 5 bars ago (trend is strengthening)
+    "REQUIRE_VOLUME_CONFIRMATION": True, # current volume > 20-day SMA volume
+    "LONG_TERM_SMA_PERIOD": 200,        # price must be above 200-day SMA (major trend bias)
 
     # Position sizing
     "RISK_PCT_PER_TRADE": 0.005,        # risk 0.5% of equity per trade

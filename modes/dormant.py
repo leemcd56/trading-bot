@@ -26,9 +26,17 @@ PARAMS = {
     "ADX_STRONG_TREND_THRESHOLD": 18,
     "NEAR_UPPER_BAND_TOLERANCE": 0.025,
     "SIMILAR_TO_YESTERDAY_PCT": 0.01,
+    "RSI_ENTRY_THRESHOLD": 50,
+    "REQUIRE_BULLISH_TRIGGER": False,
+    "BB_SQUEEZE_MAX_WIDTH_PCT": 0.04,
+    "REQUIRE_NEAR_UPPER_BAND": False,
+    # Daily-bar compensating filters (inherited from moderate for seamlessness when switching modes)
+    "REQUIRE_ADX_RISING": True,
+    "REQUIRE_VOLUME_CONFIRMATION": True,
+    "LONG_TERM_SMA_PERIOD": 100,
     "RISK_PCT_PER_TRADE": 0.01,
     "MAX_POSITION_PCT_EQUITY": 0.10,
     "MIN_SHARES": 1,
     "MAX_SHARES": 100,
-    "NOTIONAL_PER_TRADE": 75,
+    "NOTIONAL_PER_TRADE": None,
 }

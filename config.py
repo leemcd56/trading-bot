@@ -85,6 +85,16 @@ _SAFE_FALLBACKS = {
     "ADX_STRONG_TREND_THRESHOLD": 22,
     "NEAR_UPPER_BAND_TOLERANCE": 0.02,
     "SIMILAR_TO_YESTERDAY_PCT": 0.015,
+    # New mode-aware entry filters (conservative-leaning safe defaults)
+    "RSI_ENTRY_THRESHOLD": 55,
+    "REQUIRE_BULLISH_TRIGGER": True,
+    "BB_SQUEEZE_MAX_WIDTH_PCT": 0.05,
+    "REQUIRE_NEAR_UPPER_BAND": True,
+
+    # Daily-bar compensating filters (safe conservative defaults — very effective on daily data)
+    "REQUIRE_ADX_RISING": True,
+    "REQUIRE_VOLUME_CONFIRMATION": True,
+    "LONG_TERM_SMA_PERIOD": 200,
 
     # Position sizing — small risk; prefer ATR-based over fixed tiny notionals
     "RISK_PCT_PER_TRADE": 0.005,
@@ -143,6 +153,17 @@ ADX_STRONG_TREND_THRESHOLD = _mode_get("ADX_STRONG_TREND_THRESHOLD")
 NEAR_UPPER_BAND_TOLERANCE = _mode_get("NEAR_UPPER_BAND_TOLERANCE")
 SIMILAR_TO_YESTERDAY_PCT = _mode_get("SIMILAR_TO_YESTERDAY_PCT")
 
+# New mode-aware entry filters (control signal strictness per trading style)
+RSI_ENTRY_THRESHOLD = _mode_get("RSI_ENTRY_THRESHOLD")
+REQUIRE_BULLISH_TRIGGER = _mode_get("REQUIRE_BULLISH_TRIGGER")
+BB_SQUEEZE_MAX_WIDTH_PCT = _mode_get("BB_SQUEEZE_MAX_WIDTH_PCT")
+REQUIRE_NEAR_UPPER_BAND = _mode_get("REQUIRE_NEAR_UPPER_BAND")
+
+# Daily-bar compensating filters (highly effective on daily candles)
+REQUIRE_ADX_RISING = _mode_get("REQUIRE_ADX_RISING")
+REQUIRE_VOLUME_CONFIRMATION = _mode_get("REQUIRE_VOLUME_CONFIRMATION")
+LONG_TERM_SMA_PERIOD = _mode_get("LONG_TERM_SMA_PERIOD")
+
 
 # ─── Post-load validation (catches broken or reckless combinations) ─────────────
 def _validate_mode_params() -> None:
@@ -185,6 +206,24 @@ def _validate_mode_params() -> None:
                 f"aggressive NOTIONAL_PER_TRADE=${NOTIONAL_PER_TRADE} is very large; "
                 "monitor drawdowns closely"
             )
+
+    # New entry-filter sanity checks (mode-aware signal strictness)
+    if RSI_ENTRY_THRESHOLD is not None and not (20 <= RSI_ENTRY_THRESHOLD <= 80):
+        problems.append(f"RSI_ENTRY_THRESHOLD={RSI_ENTRY_THRESHOLD} is outside reasonable range [20, 80]")
+    if REQUIRE_BULLISH_TRIGGER is not None and not isinstance(REQUIRE_BULLISH_TRIGGER, bool):
+        problems.append("REQUIRE_BULLISH_TRIGGER must be a boolean")
+    if REQUIRE_NEAR_UPPER_BAND is not None and not isinstance(REQUIRE_NEAR_UPPER_BAND, bool):
+        problems.append("REQUIRE_NEAR_UPPER_BAND must be a boolean")
+    if BB_SQUEEZE_MAX_WIDTH_PCT is not None and not (0.01 <= BB_SQUEEZE_MAX_WIDTH_PCT <= 0.20):
+        problems.append(f"BB_SQUEEZE_MAX_WIDTH_PCT={BB_SQUEEZE_MAX_WIDTH_PCT} is outside reasonable range [0.01, 0.20]")
+
+    # Daily compensating filter validation
+    if REQUIRE_ADX_RISING is not None and not isinstance(REQUIRE_ADX_RISING, bool):
+        problems.append("REQUIRE_ADX_RISING must be a boolean")
+    if REQUIRE_VOLUME_CONFIRMATION is not None and not isinstance(REQUIRE_VOLUME_CONFIRMATION, bool):
+        problems.append("REQUIRE_VOLUME_CONFIRMATION must be a boolean")
+    if LONG_TERM_SMA_PERIOD is not None and not (0 <= LONG_TERM_SMA_PERIOD <= 500):
+        problems.append(f"LONG_TERM_SMA_PERIOD={LONG_TERM_SMA_PERIOD} is outside reasonable range [0, 500]")
 
     if problems:
         msg = "; ".join(problems)

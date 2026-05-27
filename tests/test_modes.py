@@ -32,6 +32,15 @@ REQUIRED_KEYS = [
     "ADX_STRONG_TREND_THRESHOLD",
     "NEAR_UPPER_BAND_TOLERANCE",
     "SIMILAR_TO_YESTERDAY_PCT",
+    # Mode-aware entry filters (from earlier work)
+    "RSI_ENTRY_THRESHOLD",
+    "REQUIRE_BULLISH_TRIGGER",
+    "BB_SQUEEZE_MAX_WIDTH_PCT",
+    "REQUIRE_NEAR_UPPER_BAND",
+    # New daily-bar compensating filters (ADX rising, volume, long-term MA)
+    "REQUIRE_ADX_RISING",
+    "REQUIRE_VOLUME_CONFIRMATION",
+    "LONG_TERM_SMA_PERIOD",
     "RISK_PCT_PER_TRADE",
     "MAX_POSITION_PCT_EQUITY",
     "MIN_SHARES",
@@ -63,7 +72,7 @@ def _patch_trade_limits():
 
 
 def _full_buy_analysis(current_price: float = 100.0) -> dict:
-    """Analysis dict that satisfies all BUY conditions."""
+    """Analysis dict that satisfies all BUY conditions (including the new daily compensating filters)."""
     return {
         "strong_trend": True,
         "uptrend": True,
@@ -83,6 +92,12 @@ def _full_buy_analysis(current_price: float = 100.0) -> dict:
         "bearish_crossover": False,
         "current_price": current_price,
         "atr_14": 1.0,
+        # New daily compensating filter flags — set True so existing behavior tests (stops, trails, notional, etc.)
+        # continue to isolate the logic they care about instead of being blocked by the new gates.
+        "adx_rising": True,
+        "volume_confirmed": True,
+        "above_long_term_ma": True,
+        "near_upper_band": True,  # needed for the conservative notional test that expects the old band gate
     }
 
 
@@ -99,10 +114,19 @@ def test_mode_has_all_required_keys(mode_name):
 
 @pytest.mark.parametrize("mode_name", ALL_MODES)
 def test_mode_values_are_positive(mode_name):
-    """All numeric params in every mode must be non-negative."""
+    """All numeric params in every mode must be non-negative (or None for NOTIONAL_PER_TRADE, 0 for LONG_TERM_SMA_PERIOD)."""
     params = _load_mode(mode_name)
     for key in REQUIRED_KEYS:
-        assert params[key] >= 0, f"{mode_name}.{key} must be >= 0, got {params[key]}"
+        val = params[key]
+        if key == "NOTIONAL_PER_TRADE":
+            # None is valid (means use risk/ATR sizing instead of fixed notional)
+            if val is None:
+                continue
+        if key == "LONG_TERM_SMA_PERIOD":
+            # 0 is valid (disabled for aggressive)
+            if val == 0:
+                continue
+        assert val is not None and val >= 0, f"{mode_name}.{key} must be >= 0 (or allowed None/0), got {val}"
 
 
 def test_aggressive_trades_more_than_moderate():
@@ -182,6 +206,96 @@ def test_conservative_adx_threshold_highest():
         assert co["ADX_STRONG_TREND_THRESHOLD"] > other["ADX_STRONG_TREND_THRESHOLD"], (
             f"conservative ADX threshold should be higher than {name}"
         )
+
+
+# New entry-filter differentiation tests (the core of making moderate a "proper" moderate mode)
+
+
+def test_moderate_has_lower_rsi_threshold_than_conservative():
+    """Moderate accepts weaker momentum; its RSI floor should be below conservative."""
+    mo = _load_mode("moderate")
+    co = _load_mode("conservative")
+    assert mo["RSI_ENTRY_THRESHOLD"] < co["RSI_ENTRY_THRESHOLD"]
+
+
+def test_aggressive_has_lowest_rsi_threshold():
+    """Aggressive is willing to enter on the weakest momentum signals."""
+    ag = _load_mode("aggressive")
+    for name in ["conservative", "moderate", "swing"]:
+        other = _load_mode(name)
+        assert ag["RSI_ENTRY_THRESHOLD"] < other["RSI_ENTRY_THRESHOLD"], (
+            f"aggressive RSI threshold should be lower than {name}"
+        )
+
+
+def test_moderate_does_not_require_bullish_trigger():
+    """Moderate can enter on established trend strength without a fresh discrete signal."""
+    mo = _load_mode("moderate")
+    assert mo["REQUIRE_BULLISH_TRIGGER"] is False
+
+
+def test_conservative_requires_bullish_trigger():
+    """Conservative demands a fresh trigger for high-conviction entries."""
+    co = _load_mode("conservative")
+    assert co["REQUIRE_BULLISH_TRIGGER"] is True
+
+
+def test_moderate_does_not_require_near_upper_band():
+    """Moderate does not force entries to be extended near the upper band."""
+    mo = _load_mode("moderate")
+    assert mo["REQUIRE_NEAR_UPPER_BAND"] is False
+
+
+def test_conservative_requires_near_upper_band():
+    """Conservative wants high-conviction band-riding entries."""
+    co = _load_mode("conservative")
+    assert co["REQUIRE_NEAR_UPPER_BAND"] is True
+
+
+def test_aggressive_has_strictest_squeeze_avoidance():
+    """Aggressive only treats extremely narrow bands as a 'squeeze' to avoid."""
+    ag = _load_mode("aggressive")
+    for name in ["conservative", "moderate", "swing"]:
+        other = _load_mode(name)
+        assert ag["BB_SQUEEZE_MAX_WIDTH_PCT"] < other["BB_SQUEEZE_MAX_WIDTH_PCT"], (
+            f"aggressive squeeze threshold should be lower than {name}"
+        )
+
+
+# New daily compensating filter tests (the main request for fixing aggressive on daily data)
+
+
+def test_conservative_requires_adx_rising_and_volume():
+    """Conservative uses the strongest daily filters."""
+    co = _load_mode("conservative")
+    assert co["REQUIRE_ADX_RISING"] is True
+    assert co["REQUIRE_VOLUME_CONFIRMATION"] is True
+    assert co["LONG_TERM_SMA_PERIOD"] == 200
+
+
+def test_moderate_requires_daily_filters_but_shorter_ma():
+    """Moderate keeps the daily guardrails but uses a shorter long-term MA."""
+    mo = _load_mode("moderate")
+    assert mo["REQUIRE_ADX_RISING"] is True
+    assert mo["REQUIRE_VOLUME_CONFIRMATION"] is True
+    assert mo["LONG_TERM_SMA_PERIOD"] == 100
+
+
+def test_aggressive_relaxes_most_daily_filters_but_keeps_adx_rising():
+    """Aggressive turns off volume and long-term MA (to stay aggressive) but still requires ADX rising
+    — this single filter is one of the highest-ROI improvements possible on daily bars."""
+    ag = _load_mode("aggressive")
+    assert ag["REQUIRE_ADX_RISING"] is True
+    assert ag["REQUIRE_VOLUME_CONFIRMATION"] is False
+    assert ag["LONG_TERM_SMA_PERIOD"] == 0
+
+
+def test_swing_uses_strict_daily_filters():
+    """Swing wants clean, high-quality daily setups for multi-day holds."""
+    sw = _load_mode("swing")
+    assert sw["REQUIRE_ADX_RISING"] is True
+    assert sw["REQUIRE_VOLUME_CONFIRMATION"] is True
+    assert sw["LONG_TERM_SMA_PERIOD"] == 200
 
 
 # ─── 2. Config loading ────────────────────────────────────────────────────────
