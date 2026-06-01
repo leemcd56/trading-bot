@@ -536,6 +536,9 @@ def execute_trade(symbol: str, analysis: dict | None):
         core_ok = core_ok and bool(analysis.get('above_long_term_ma'))
 
     if core_ok:
+        if _would_sell_be_day_trade(symbol):
+            logger.warning(f"{symbol}: Skipping BUY - already purchased today (one entry per symbol per day)")
+            return
         if _open_positions_count() >= MAX_OPEN_POSITIONS:
             logger.warning(f"{symbol}: Skipping BUY - max open positions ({MAX_OPEN_POSITIONS})")
             return
@@ -589,6 +592,12 @@ def execute_trade(symbol: str, analysis: dict | None):
                 logger.warning(f"{symbol}: Skipping BUY - could not fetch account equity")
                 return
             qty = _compute_buy_qty(analysis, equity) if equity > 0 else MIN_SHARES
+            price = analysis.get("current_price") or 0
+            order_value = qty * price
+            buying_power = _get_buying_power()
+            if order_value > 0 and buying_power < order_value:
+                logger.warning(f"{symbol}: Skipping BUY - insufficient buying power (${buying_power:.2f} < ${order_value:.2f})")
+                return
             order = MarketOrderRequest(
                 symbol=symbol,
                 qty=qty,
