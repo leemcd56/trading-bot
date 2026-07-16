@@ -36,6 +36,9 @@ PARAMS = {
     "REQUIRE_VOLUME_CONFIRMATION": True, # current volume > 20-day SMA volume
     "LONG_TERM_SMA_PERIOD": 200,        # price must be above 200-day SMA (major trend bias)
 
+    # Min hold before discretionary TA signal exits (stops still fire immediately)
+    "MIN_HOLD_HOURS": 24,               # overnight minimum; avoid whipsaw exits
+
     # Position sizing
     "RISK_PCT_PER_TRADE": 0.005,        # risk 0.5% of equity per trade
     "MAX_POSITION_PCT_EQUITY": 0.08,    # cap any single position at 8% of equity

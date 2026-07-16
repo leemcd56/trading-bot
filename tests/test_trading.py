@@ -26,6 +26,9 @@ def _patch_trade_limits():
         _get_trail_running_high=lambda symbol: None,
         _set_trail_running_high=lambda symbol, running_high: None,
         _clear_trail_state=lambda symbol: None,
+        # Allow discretionary TA sells in unit tests unless a test overrides this
+        _should_block_sell_min_hold=lambda symbol: False,
+        MIN_HOLD_HOURS=0,
     )
 
 
@@ -496,3 +499,116 @@ def test_trailing_stop_does_not_sell_when_price_has_not_dropped_enough():
             }
             trading.execute_trade("TEST", analysis)
         mock_client.submit_order.assert_not_called()
+
+
+def test_bare_sar_above_price_does_not_sell_while_uptrend():
+    """Price below SAR alone must not dump a position that is still in an uptrend (+DI > -DI)."""
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client:
+        mock_client.get_open_position.return_value = MagicMock(
+            qty=1, avg_entry_price="100.0"
+        )
+        analysis = {
+            "strong_trend": True,
+            "uptrend": True,
+            "trending_up_a_lot": False,
+            "current_price": 101.0,
+            "near_lower_band": False,
+            "sar_above_price": True,  # previously this alone forced a SELL
+            "sar_flipped_to_bear": False,
+            "dive_bombing": False,
+            "bearish_crossover": False,
+            "similar_to_yesterday": False,
+            "bb_squeeze": False,
+            "avoid_long": False,
+            "sar_below_price": False,
+        }
+        trading.execute_trade("TEST", analysis)
+        mock_client.submit_order.assert_not_called()
+
+
+def test_sar_above_plus_downtrend_does_sell():
+    """SAR bearish regime + DI downtrend is a confirmed exit."""
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client:
+        mock_client.get_open_position.return_value = MagicMock(
+            qty=1, avg_entry_price="100.0"
+        )
+        analysis = {
+            "strong_trend": True,
+            "uptrend": False,
+            "trending_up_a_lot": False,
+            "current_price": 99.0,
+            "near_lower_band": False,
+            "sar_above_price": True,
+            "sar_flipped_to_bear": False,
+            "dive_bombing": False,
+            "bearish_crossover": False,
+        }
+        trading.execute_trade("TEST", analysis)
+        mock_client.submit_order.assert_called_once()
+        assert mock_client.submit_order.call_args[0][0].side == OrderSide.SELL
+
+
+def test_min_hold_blocks_ta_signal_sell_but_not_stop_loss():
+    """MIN_HOLD_HOURS blocks discretionary TA exits; stop-loss still fires."""
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "_should_block_sell_min_hold", return_value=True):
+        mock_client.get_open_position.return_value = MagicMock(
+            qty=1, avg_entry_price="100.0"
+        )
+        analysis = {
+            "strong_trend": True,
+            "uptrend": False,
+            "current_price": 99.0,
+            "near_lower_band": False,
+            "sar_above_price": True,
+            "sar_flipped_to_bear": False,
+            "dive_bombing": False,
+            "bearish_crossover": False,
+            "trending_up_a_lot": False,
+        }
+        trading.execute_trade("TEST", analysis)
+        mock_client.submit_order.assert_not_called()
+
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "_should_block_sell_min_hold", return_value=True), \
+         patch.object(trading, "STOP_LOSS_PCT", 0.05):
+        mock_client.get_open_position.return_value = MagicMock(
+            qty=1, avg_entry_price="100.0"
+        )
+        analysis = {
+            "strong_trend": True,
+            "current_price": 94.0,
+        }
+        trading.execute_trade("TEST", analysis)
+        mock_client.submit_order.assert_called_once()
+        assert mock_client.submit_order.call_args[0][0].side == OrderSide.SELL
+
+
+def test_stop_loss_fires_without_strong_trend():
+    """Stops must protect capital even when ADX is weak (no strong_trend)."""
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "STOP_LOSS_PCT", 0.05):
+        mock_client.get_open_position.return_value = MagicMock(
+            qty=1, avg_entry_price="100.0"
+        )
+        analysis = {
+            "strong_trend": False,
+            "current_price": 94.0,
+        }
+        trading.execute_trade("TEST", analysis)
+        mock_client.submit_order.assert_called_once()
+        assert mock_client.submit_order.call_args[0][0].side == OrderSide.SELL
+
+
+def test_ta_sell_signal_helper():
+    """Unit-check the confirmed-exit combinator used by execute_trade."""
+    assert trading._ta_sell_signal({"dive_bombing": True}) is True
+    assert trading._ta_sell_signal({"sar_flipped_to_bear": True}) is True
+    assert trading._ta_sell_signal({"sar_above_price": True, "uptrend": True}) is False
+    assert trading._ta_sell_signal({"sar_above_price": True, "uptrend": False}) is True
+    assert trading._ta_sell_signal(
+        {"near_lower_band": True, "uptrend": True, "sar_above_price": False}
+    ) is False
+    assert trading._ta_sell_signal(
+        {"near_lower_band": True, "uptrend": False}
+    ) is True

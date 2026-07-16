@@ -55,7 +55,7 @@ Never commit `.env`; it is gitignored.
 python main.py
 ```
 
-The bot runs every 60 minutes (configurable) while the US market is open (9:30 AM–4:00 PM ET, Mon–Fri). Logs go to `logs/bot.log` and the console.
+The bot runs on two schedules while the US market is open (9:30 AM–4:00 PM ET, Mon–Fri): TA analysis every 15 minutes and FMP signal checks every 10 minutes (both configurable via env). Logs go to `logs/bot.log` and the console.
 
 ---
 
@@ -93,7 +93,8 @@ Edit **`config.py`** or set env vars to override individual settings. Risk param
 | Variable | Default | Description |
 |----------|---------|--------------|
 | `SYMBOLS` | `['AAPL', 'TSLA', 'GOOG', 'MSFT']` | Watchlist / symbols to trade (overridable via `WATCH_SYMBOLS` env var) |
-| `CHECK_INTERVAL_MINUTES` | `60` | Minutes between each run |
+| `CHECK_INTERVAL_MINUTES` | `15` | Minutes between TA analyze/trade cycles (env-overridable) |
+| `FMP_CHECK_INTERVAL_MINUTES` | `10` | Minutes between FMP analyst signal checks (env-overridable) |
 | `DB_PATH` | MotherDuck | Requires `MOTHERDUCK_TOKEN` in `.env`; there is no local file fallback |
 | `TRENDS_RETAIN_DAYS` | `365` | Keep this many days of candle data; older rows are pruned each run |
 | `TRADE_LOG_RETAIN_DAYS` | `30` | Keep this many days of trade log; older rows pruned (weekly count needs 7+) |
@@ -186,7 +187,7 @@ Conservative and swing require all three; moderate requires them with a 100-day 
 
 ### Scheduler and utils
 
-- **`main.py`** — Runs `job()` every `CHECK_INTERVAL_MINUTES`. `job()` skips when the market is closed; first fetches external signals (`signals.fetch_signals`) and executes any signal-driven buys/sells, then for each symbol in `SYMBOLS` calls fetch → analyze → execute_trade. Errors are caught per symbol and per signal.
+- **`main.py`** — Schedules `ta_job()` every `CHECK_INTERVAL_MINUTES` and `fmp_job()` every `FMP_CHECK_INTERVAL_MINUTES`. Both skip when the market is closed. FMP job fetches analyst signals and runs signal buys/sells; TA job loops each symbol: fetch → analyze → execute_trade. Errors are caught per symbol and per signal.
 - **`utils`** — `is_market_open()` (US/Eastern, Mon–Fri 9:30–16:00), logger (file + console), and `logs/` directory created on startup.
 
 ---
@@ -312,7 +313,7 @@ python -m pytest tests/ -v
 
 ## Deployment
 
-The bot is a **long-running process**: it loops every 60 minutes and only does work during US market hours. You need a machine that stays on (or a server that runs 24/7).
+The bot is a **long-running process**: it loops every 10–15 minutes (FMP/TA) and only does work during US market hours. You need a machine that stays on (or a server that runs 24/7).
 
 ### Where to run
 
@@ -336,7 +337,7 @@ From the project root with venv activated:
 python main.py
 ```
 
-Runs forever; schedule fires every 60 minutes. Logs go to `logs/bot.log` and the console.
+Runs forever; schedule fires TA every 15 minutes and FMP every 10 minutes by default. Logs go to `logs/bot.log` and the console.
 
 **2. Docker**  
 Build and run; mount the project dir so the container uses your `.env`, and `trends.db` and `logs/` persist on the host:

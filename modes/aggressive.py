@@ -39,11 +39,14 @@ PARAMS = {
     "BB_SQUEEZE_MAX_WIDTH_PCT": 0.03,   # only extremely tight bands (<3%) count as a squeeze to avoid
     "REQUIRE_NEAR_UPPER_BAND": False,   # enter on trend strength without needing upper-band extension
 
-    # Daily-bar compensating filters (aggressive relaxes most for early entries, but keeps ADX rising
-    # as a minimal daily-appropriate guardrail against pure chop — this alone helps a lot on daily bars).
-    "REQUIRE_ADX_RISING": True,         # still wants the trend to be strengthening (very effective daily filter)
+    # Daily-bar compensating filters — aggressive turns these off for activity.
+    # ADX rising alone was rejecting most early trends on daily bars.
+    "REQUIRE_ADX_RISING": False,
     "REQUIRE_VOLUME_CONFIRMATION": False, # volume filter turned off (accepts lower-volume early moves)
     "LONG_TERM_SMA_PERIOD": 0,          # disabled — aggressive does not require major trend alignment
+
+    # Min hold before discretionary TA signal exits (stops still fire immediately)
+    "MIN_HOLD_HOURS": 0,                # can flip same day when risk allows
 
     # Position sizing
     "RISK_PCT_PER_TRADE": 0.02,         # risk 2% of equity per trade

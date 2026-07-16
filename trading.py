@@ -33,6 +33,7 @@ from config import (
     REQUIRE_ADX_RISING,
     REQUIRE_VOLUME_CONFIRMATION,
     LONG_TERM_SMA_PERIOD,
+    MIN_HOLD_HOURS,
 )
 
 load_dotenv()
@@ -348,6 +349,70 @@ def _compute_buy_qty(analysis: dict, equity: float) -> int:
     return qty
 
 
+def _last_buy_ts(symbol: str) -> float | None:
+    """Unix timestamp of the most recent BUY for symbol in the trade log, or None."""
+    con = duckdb.connect(DB_PATH)
+    try:
+        _ensure_trade_log(con)
+        out = con.execute(
+            f"SELECT MAX(timestamp_utc) FROM {TRADE_LOG_TABLE} WHERE symbol = ? AND side = 'BUY'",
+            [symbol],
+        ).fetchone()
+        return float(out[0]) if out and out[0] is not None else None
+    finally:
+        con.close()
+
+
+def _held_seconds(symbol: str) -> float | None:
+    """Seconds since last BUY of symbol, or None if no buy record."""
+    last_buy = _last_buy_ts(symbol)
+    if last_buy is None:
+        return None
+    return time.time() - last_buy
+
+
+def _should_block_sell_min_hold(symbol: str) -> bool:
+    """
+    True if mode min-hold has not elapsed since the last BUY.
+    Stop-loss / trailing-stop should NOT use this — only discretionary TA signal exits.
+    No buy record → allow (manual/legacy positions; operator may still want out).
+    """
+    if MIN_HOLD_HOURS is None or MIN_HOLD_HOURS <= 0:
+        return False
+    held = _held_seconds(symbol)
+    if held is None:
+        return False
+    return held < float(MIN_HOLD_HOURS) * 3600
+
+
+def _ta_sell_signal(analysis: dict) -> bool:
+    """
+    Confirmed exit for TA path. Bare `sar_above_price` alone is NOT enough —
+    that flag is true whenever price is below SAR, which dumps healthy holdings
+    on routine noise. Require a real bearish confirmation.
+    """
+    dive = bool(analysis.get("dive_bombing"))
+    sar_flip_bear = bool(analysis.get("sar_flipped_to_bear"))
+    near_lower = bool(analysis.get("near_lower_band"))
+    bear_x = bool(analysis.get("bearish_crossover"))
+    sar_above = bool(analysis.get("sar_above_price"))
+    uptrend = bool(analysis.get("uptrend"))
+
+    # Hard exits: crash or explicit SAR regime flip on the latest bar
+    if dive or sar_flip_bear:
+        return True
+    # Band support broken only with directional confirmation
+    if near_lower and (sar_above or not uptrend):
+        return True
+    # DI bearish cross only with SAR or downtrend agreement
+    if bear_x and (sar_above or not uptrend):
+        return True
+    # SAR bearish regime only when DI also agrees the uptrend is gone
+    if sar_above and not uptrend:
+        return True
+    return False
+
+
 def _skip_reasons_buy(analysis: dict) -> list[str]:
     """Return list of reasons we are not buying (for logging)."""
     reasons = []
@@ -420,124 +485,166 @@ def _buy_gate_scorecard(analysis: dict) -> str:
     return " ".join([f"{name}={'Y' if ok else 'N'}" for name, ok in gates])
 
 
-def execute_trade(symbol: str, analysis: dict | None):
-    if not analysis or not analysis.get('strong_trend', False):
-        logger.info(f"{symbol}: Skipping - no strong trend")
-        return
-
-    # ─── Risk limits ───
-    if _count_daily() >= MAX_DAILY_TRADES:
-        logger.warning(f"{symbol}: Skipping - daily trade cap reached ({_count_daily()}/{MAX_DAILY_TRADES})")
-        return
-    if _count_weekly() >= MAX_WEEKLY_TRADES:
-        logger.warning(f"{symbol}: Skipping - weekly trade cap reached ({_count_weekly()}/{MAX_WEEKLY_TRADES})")
-        return
-
-    # ─── Stop-loss: sell if position is down STOP_LOSS_PCT from entry ───
+def _try_risk_exit(symbol: str, analysis: dict) -> bool:
+    """
+    Stop-loss and trailing-stop. Runs regardless of strong_trend so protection
+    is never gated on ADX. Returns True if an exit order was submitted (or
+    intentionally blocked by PDT after a trigger).
+    """
     try:
         position = trading_client.get_open_position(symbol)
         qty = float(position.qty)
-        if qty > 0:
-            entry = float(position.avg_entry_price)
-            current = analysis.get("current_price") or 0
-            if entry > 0 and current > 0 and current <= entry * (1 - STOP_LOSS_PCT):
-                if _should_block_sell_pdt(symbol):
-                    logger.warning(
-                        f"{symbol}: Skipping stop-loss SELL - PDT limit reached ({_count_day_trades_in_last_5_days()}/{MAX_DAY_TRADES_IN_5_DAYS} day trades in 5 days)"
-                    )
-                    send_alert(
-                        f"{symbol}: Stop-loss skipped (PDT limit). Consider closing tomorrow.",
-                        "error",
-                    )
-                    return
-                order = MarketOrderRequest(
-                    symbol=symbol,
-                    qty=qty,
-                    side=OrderSide.SELL,
-                    time_in_force=TimeInForce.DAY
+        if qty <= 0:
+            return False
+        entry = float(position.avg_entry_price)
+        current = analysis.get("current_price") or 0
+        if entry <= 0 or current <= 0:
+            return False
+
+        # ─── Stop-loss ───
+        if current <= entry * (1 - STOP_LOSS_PCT):
+            if _should_block_sell_pdt(symbol):
+                logger.warning(
+                    f"{symbol}: Skipping stop-loss SELL - PDT limit reached "
+                    f"({_count_day_trades_in_last_5_days()}/{MAX_DAY_TRADES_IN_5_DAYS} day trades in 5 days)"
                 )
-                try:
-                    trading_client.submit_order(order)
-                except Exception as order_err:
-                    logger.error(f"Stop-loss order submission failed for {symbol}: {order_err}")
-                    send_alert(f"Stop-loss order FAILED for {symbol}: {order_err}", "error")
-                    return
-                _record_trade(symbol, "SELL", qty)
-                _record_trade_history(symbol, "SELL", qty, current, "stop-loss")
-                _clear_trail_state(symbol)
-                logger.warning(f"Stop-loss SELL for {symbol}: price {current:.2f} <= entry {entry:.2f} * (1 - {STOP_LOSS_PCT:.0%})")
-                send_alert(f"Stop-loss SELL {symbol} qty={qty:.4g} @ {current:.2f} (entry {entry:.2f})", "trade")
-                return
-            # ─── Trailing stop: after fixed stop-loss, lock in gains once price is TRAIL_ACTIVATION_PCT above entry ───
-            running_high = _get_trail_running_high(symbol)
-            if running_high is None:
-                running_high = current
-            else:
-                running_high = max(running_high, current)
-            _set_trail_running_high(symbol, running_high)
-            trail_active = current >= entry * (1 + TRAIL_ACTIVATION_PCT)
-            if trail_active and current <= running_high * (1 - TRAIL_PCT):
-                if _should_block_sell_pdt(symbol):
-                    logger.warning(
-                        f"{symbol}: Skipping trailing-stop SELL - PDT limit reached ({_count_day_trades_in_last_5_days()}/{MAX_DAY_TRADES_IN_5_DAYS} day trades in 5 days)"
-                    )
-                    send_alert(f"{symbol}: Trailing-stop skipped (PDT limit). Consider closing tomorrow.", "error")
-                    return
-                order = MarketOrderRequest(
-                    symbol=symbol,
-                    qty=qty,
-                    side=OrderSide.SELL,
-                    time_in_force=TimeInForce.DAY
+                send_alert(
+                    f"{symbol}: Stop-loss skipped (PDT limit). Consider closing tomorrow.",
+                    "error",
                 )
-                try:
-                    trading_client.submit_order(order)
-                except Exception as order_err:
-                    logger.error(f"Trailing-stop order submission failed for {symbol}: {order_err}")
-                    send_alert(f"Trailing-stop order FAILED for {symbol}: {order_err}", "error")
-                    return
-                _record_trade(symbol, "SELL", qty)
-                _record_trade_history(symbol, "SELL", qty, current, "trailing-stop")
-                _clear_trail_state(symbol)
-                logger.warning(f"Trailing-stop SELL for {symbol}: price {current:.2f} <= running_high {running_high:.2f} * (1 - {TRAIL_PCT:.0%})")
-                send_alert(f"Trailing-stop SELL {symbol} qty={qty:.4g} @ {current:.2f} (running_high {running_high:.2f})", "trade")
-                return
+                return True
+            order = MarketOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.DAY,
+            )
+            try:
+                trading_client.submit_order(order)
+            except Exception as order_err:
+                logger.error(f"Stop-loss order submission failed for {symbol}: {order_err}")
+                send_alert(f"Stop-loss order FAILED for {symbol}: {order_err}", "error")
+                return True
+            _record_trade(symbol, "SELL", qty)
+            _record_trade_history(symbol, "SELL", qty, current, "stop-loss")
+            _clear_trail_state(symbol)
+            logger.warning(
+                f"Stop-loss SELL for {symbol}: price {current:.2f} <= entry {entry:.2f} "
+                f"* (1 - {STOP_LOSS_PCT:.0%})"
+            )
+            send_alert(
+                f"Stop-loss SELL {symbol} qty={qty:.4g} @ {current:.2f} (entry {entry:.2f})",
+                "trade",
+            )
+            return True
+
+        # ─── Trailing stop ───
+        running_high = _get_trail_running_high(symbol)
+        if running_high is None:
+            running_high = current
+        else:
+            running_high = max(running_high, current)
+        _set_trail_running_high(symbol, running_high)
+        trail_active = current >= entry * (1 + TRAIL_ACTIVATION_PCT)
+        if trail_active and current <= running_high * (1 - TRAIL_PCT):
+            if _should_block_sell_pdt(symbol):
+                logger.warning(
+                    f"{symbol}: Skipping trailing-stop SELL - PDT limit reached "
+                    f"({_count_day_trades_in_last_5_days()}/{MAX_DAY_TRADES_IN_5_DAYS} day trades in 5 days)"
+                )
+                send_alert(
+                    f"{symbol}: Trailing-stop skipped (PDT limit). Consider closing tomorrow.",
+                    "error",
+                )
+                return True
+            order = MarketOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.DAY,
+            )
+            try:
+                trading_client.submit_order(order)
+            except Exception as order_err:
+                logger.error(f"Trailing-stop order submission failed for {symbol}: {order_err}")
+                send_alert(f"Trailing-stop order FAILED for {symbol}: {order_err}", "error")
+                return True
+            _record_trade(symbol, "SELL", qty)
+            _record_trade_history(symbol, "SELL", qty, current, "trailing-stop")
+            _clear_trail_state(symbol)
+            logger.warning(
+                f"Trailing-stop SELL for {symbol}: price {current:.2f} <= running_high "
+                f"{running_high:.2f} * (1 - {TRAIL_PCT:.0%})"
+            )
+            send_alert(
+                f"Trailing-stop SELL {symbol} qty={qty:.4g} @ {current:.2f} "
+                f"(running_high {running_high:.2f})",
+                "trade",
+            )
+            return True
     except Exception as e:
         if "position does not exist" not in str(e).lower() and "not found" not in str(e).lower():
             logger.error(f"Position check failed for {symbol}: {e}")
+    return False
+
+
+def execute_trade(symbol: str, analysis: dict | None):
+    if not analysis:
+        logger.info(f"{symbol}: Skipping - no analysis")
+        return
+
+    # Risk exits always run first (even without strong_trend) so stops protect capital.
+    if _try_risk_exit(symbol, analysis):
+        return
+
+    if not analysis.get("strong_trend", False):
+        logger.info(f"{symbol}: Skipping - no strong trend")
+        return
 
     bullish_trigger = (
-        analysis.get('bullish_crossover')
-        or analysis.get('sar_flipped_to_bull')
-        or analysis.get('bullish_crossover_recent', False)
-        or analysis.get('sar_flipped_to_bull_recent', False)
+        analysis.get("bullish_crossover")
+        or analysis.get("sar_flipped_to_bull")
+        or analysis.get("bullish_crossover_recent", False)
+        or analysis.get("sar_flipped_to_bull_recent", False)
     )
 
-    # Core BUY decision — many gates are now mode-dependent.
-    # The daily compensating filters (adx_rising, volume_confirmed, above_long_term_ma)
-    # are the main new guardrails that make aggressive viable on daily bars.
+    # Core BUY decision — many gates are mode-dependent.
     core_ok = (
-        analysis.get('trending_up_a_lot') and
-        analysis.get('sar_below_price') and
-        not analysis.get('similar_to_yesterday', False) and
-        not analysis.get('bb_squeeze', False) and
-        not analysis.get('avoid_long', False)
+        analysis.get("trending_up_a_lot")
+        and analysis.get("sar_below_price")
+        and not analysis.get("similar_to_yesterday", False)
+        and not analysis.get("bb_squeeze", False)
+        and not analysis.get("avoid_long", False)
     )
     if REQUIRE_BULLISH_TRIGGER:
         core_ok = core_ok and bool(bullish_trigger)
     if REQUIRE_NEAR_UPPER_BAND:
-        core_ok = core_ok and bool(analysis.get('near_upper_band'))
-
-    # New daily-bar compensating filters (the key request for fixing aggressive on daily data)
+        core_ok = core_ok and bool(analysis.get("near_upper_band"))
     if REQUIRE_ADX_RISING:
-        core_ok = core_ok and bool(analysis.get('adx_rising'))
+        core_ok = core_ok and bool(analysis.get("adx_rising"))
     if REQUIRE_VOLUME_CONFIRMATION:
-        core_ok = core_ok and bool(analysis.get('volume_confirmed'))
+        core_ok = core_ok and bool(analysis.get("volume_confirmed"))
     if LONG_TERM_SMA_PERIOD and LONG_TERM_SMA_PERIOD > 0:
-        core_ok = core_ok and bool(analysis.get('above_long_term_ma'))
+        core_ok = core_ok and bool(analysis.get("above_long_term_ma"))
 
     if core_ok:
+        # Daily/weekly caps apply to new entries only — never block exits.
+        if _count_daily() >= MAX_DAILY_TRADES:
+            logger.warning(
+                f"{symbol}: Skipping BUY - daily trade cap reached "
+                f"({_count_daily()}/{MAX_DAILY_TRADES})"
+            )
+            return
+        if _count_weekly() >= MAX_WEEKLY_TRADES:
+            logger.warning(
+                f"{symbol}: Skipping BUY - weekly trade cap reached "
+                f"({_count_weekly()}/{MAX_WEEKLY_TRADES})"
+            )
+            return
         if _would_sell_be_day_trade(symbol):
-            logger.warning(f"{symbol}: Skipping BUY - already purchased today (one entry per symbol per day)")
+            logger.warning(
+                f"{symbol}: Skipping BUY - already purchased today (one entry per symbol per day)"
+            )
             return
         if _open_positions_count() >= MAX_OPEN_POSITIONS:
             logger.warning(f"{symbol}: Skipping BUY - max open positions ({MAX_OPEN_POSITIONS})")
@@ -547,12 +654,11 @@ def execute_trade(symbol: str, analysis: dict | None):
             buying_power = _get_buying_power()
             price = analysis.get("current_price") or 0
             if price > 0 and price <= NOTIONAL_PER_TRADE and buying_power >= price:
-                # Buy one whole share when it costs less than or equal to our notional target
                 order = MarketOrderRequest(
                     symbol=symbol,
                     qty=1,
                     side=OrderSide.BUY,
-                    time_in_force=TimeInForce.DAY
+                    time_in_force=TimeInForce.DAY,
                 )
                 try:
                     trading_client.submit_order(order)
@@ -562,19 +668,24 @@ def execute_trade(symbol: str, analysis: dict | None):
                     return
                 _record_trade(symbol, "BUY", 1)
                 _record_trade_history(symbol, "BUY", 1, price, "ta")
-                logger.info(f"BUY submitted for {symbol} qty=1 (whole share, price ${price:.2f} <= ${NOTIONAL_PER_TRADE})")
+                logger.info(
+                    f"BUY submitted for {symbol} qty=1 "
+                    f"(whole share, price ${price:.2f} <= ${NOTIONAL_PER_TRADE})"
+                )
                 send_alert(f"BUY {symbol} 1 share @ ~${price:.2f}", "trade")
             else:
                 notional = min(float(NOTIONAL_PER_TRADE), buying_power) if buying_power > 0 else 0.0
                 if notional < 1:
-                    logger.warning(f"{symbol}: Skipping BUY - notional ${notional:.2f} below Alpaca minimum $1")
+                    logger.warning(
+                        f"{symbol}: Skipping BUY - notional ${notional:.2f} below Alpaca minimum $1"
+                    )
                     return
                 notional = round(notional, 2)
                 order = MarketOrderRequest(
                     symbol=symbol,
                     notional=notional,
                     side=OrderSide.BUY,
-                    time_in_force=TimeInForce.DAY
+                    time_in_force=TimeInForce.DAY,
                 )
                 try:
                     trading_client.submit_order(order)
@@ -596,13 +707,16 @@ def execute_trade(symbol: str, analysis: dict | None):
             order_value = qty * price
             buying_power = _get_buying_power()
             if order_value > 0 and buying_power < order_value:
-                logger.warning(f"{symbol}: Skipping BUY - insufficient buying power (${buying_power:.2f} < ${order_value:.2f})")
+                logger.warning(
+                    f"{symbol}: Skipping BUY - insufficient buying power "
+                    f"(${buying_power:.2f} < ${order_value:.2f})"
+                )
                 return
             order = MarketOrderRequest(
                 symbol=symbol,
                 qty=qty,
                 side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY
+                time_in_force=TimeInForce.DAY,
             )
             try:
                 trading_client.submit_order(order)
@@ -615,13 +729,7 @@ def execute_trade(symbol: str, analysis: dict | None):
             logger.info(f"BUY submitted for {symbol} qty={qty}")
             send_alert(f"BUY {symbol} qty={qty}", "trade")
 
-    elif (
-        analysis.get('near_lower_band') or
-        analysis.get('sar_above_price') or
-        analysis.get('sar_flipped_to_bear') or
-        analysis.get('dive_bombing') or
-        analysis.get('bearish_crossover')
-    ):
+    elif _ta_sell_signal(analysis):
         try:
             position = trading_client.get_open_position(symbol)
             qty = float(position.qty)
@@ -630,17 +738,26 @@ def execute_trade(symbol: str, analysis: dict | None):
                 logger.error(f"Position check failed for {symbol}: {e}")
             qty = 0
         if qty > 0:
-            if _should_block_sell_pdt(symbol):
-                logger.warning(
-                    f"{symbol}: Skipping signal SELL - PDT limit reached ({_count_day_trades_in_last_5_days()}/{MAX_DAY_TRADES_IN_5_DAYS} day trades in 5 days)"
+            if _should_block_sell_min_hold(symbol):
+                logger.info(
+                    f"{symbol}: Skipping signal SELL - min hold not met "
+                    f"(need {MIN_HOLD_HOURS}h); stop-loss still active"
                 )
-                send_alert(f"{symbol}: Signal SELL skipped (PDT limit). Consider closing tomorrow.", "error")
+            elif _should_block_sell_pdt(symbol):
+                logger.warning(
+                    f"{symbol}: Skipping signal SELL - PDT limit reached "
+                    f"({_count_day_trades_in_last_5_days()}/{MAX_DAY_TRADES_IN_5_DAYS} day trades in 5 days)"
+                )
+                send_alert(
+                    f"{symbol}: Signal SELL skipped (PDT limit). Consider closing tomorrow.",
+                    "error",
+                )
             else:
                 order = MarketOrderRequest(
                     symbol=symbol,
                     qty=qty,
                     side=OrderSide.SELL,
-                    time_in_force=TimeInForce.DAY
+                    time_in_force=TimeInForce.DAY,
                 )
                 try:
                     trading_client.submit_order(order)
@@ -747,29 +864,21 @@ def execute_signal_buy(symbol: str) -> None:
 def execute_signal_sell(symbol: str) -> None:
     """
     Sell symbol based on an external signal.
-    Requires the position to have been held for at least 24 hours so we
-    never flip a same-day buy into a day trade from a signal change.
+    Requires a minimum hold (mode MIN_HOLD_HOURS, defaulting to 24h if unset)
+    so we never flip a same-day buy into a day trade from a signal change.
     """
-    # 24-hour minimum hold: look up the most recent BUY in the trade log.
-    con = duckdb.connect(DB_PATH)
-    try:
-        _ensure_trade_log(con)
-        out = con.execute(
-            f"SELECT MAX(timestamp_utc) FROM {TRADE_LOG_TABLE} WHERE symbol = ? AND side = 'BUY'",
-            [symbol],
-        ).fetchone()
-        last_buy_ts = float(out[0]) if out and out[0] is not None else None
-    finally:
-        con.close()
-
+    last_buy_ts = _last_buy_ts(symbol)
     if last_buy_ts is None:
         logger.info(f"{symbol} [signal]: No buy record found, skipping signal SELL")
         return
 
     held_seconds = time.time() - last_buy_ts
-    if held_seconds < 86400:
+    # Signal path always enforces at least 24h; modes may require longer via MIN_HOLD_HOURS.
+    min_hours = max(24.0, float(MIN_HOLD_HOURS or 0))
+    if held_seconds < min_hours * 3600:
         logger.info(
-            f"{symbol} [signal]: Skipping SELL - held only {held_seconds / 3600:.1f}h (need 24h)"
+            f"{symbol} [signal]: Skipping SELL - held only {held_seconds / 3600:.1f}h "
+            f"(need {min_hours:.0f}h)"
         )
         return
 

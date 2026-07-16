@@ -42,6 +42,9 @@ PARAMS = {
     "REQUIRE_VOLUME_CONFIRMATION": True, # current volume > 20-day SMA volume
     "LONG_TERM_SMA_PERIOD": 100,        # price must be above 100-day SMA (intermediate trend bias)
 
+    # Min hold before discretionary TA signal exits (stops still fire immediately)
+    "MIN_HOLD_HOURS": 24,               # at least overnight before signal exit
+
     # Position sizing (risk-based is preferred for moderate)
     "RISK_PCT_PER_TRADE": 0.01,         # risk 1% of equity per trade
     "MAX_POSITION_PCT_EQUITY": 0.10,    # cap any single position at 10% of equity

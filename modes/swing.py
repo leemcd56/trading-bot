@@ -36,6 +36,9 @@ PARAMS = {
     "REQUIRE_VOLUME_CONFIRMATION": True, # volume confirmation helps on daily swing entries
     "LONG_TERM_SMA_PERIOD": 200,        # strong major-trend alignment for longer holds
 
+    # Min hold before discretionary TA signal exits (stops still fire immediately)
+    "MIN_HOLD_HOURS": 48,               # multi-day holds; let swing setups breathe
+
     # Position sizing
     "RISK_PCT_PER_TRADE": 0.015,        # risk 1.5% of equity per trade
     "MAX_POSITION_PCT_EQUITY": 0.12,    # cap any single position at 12% of equity

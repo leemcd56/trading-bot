@@ -131,6 +131,7 @@ if __name__ == "__main__":
 
     logger.info(
         f"Trading bot started | mode={TRADING_MODE.upper()} | symbols={SYMBOLS} | "
+        f"ta_every={CHECK_INTERVAL_MINUTES}m fmp_every={FMP_CHECK_INTERVAL_MINUTES}m | "
         f"daily_cap={MAX_DAILY_TRADES} weekly_cap={MAX_WEEKLY_TRADES} "
         f"max_positions={MAX_OPEN_POSITIONS} | "
         f"stop={STOP_LOSS_PCT:.0%} trail_activate={TRAIL_ACTIVATION_PCT:.0%} trail={TRAIL_PCT:.0%} | "

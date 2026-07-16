@@ -136,7 +136,13 @@ def _analyze_df(symbol: str, df: pd.DataFrame, use_staleness_check: bool) -> dic
         if _ok(bb_middle) and float(bb_middle) != 0
         else 1.0
     )
-    bb_squeeze = bb_width_pct < 0.04
+    # Mode-aware squeeze threshold (was hardcoded 0.04 — modes never took effect)
+    squeeze_threshold = (
+        float(BB_SQUEEZE_MAX_WIDTH_PCT)
+        if BB_SQUEEZE_MAX_WIDTH_PCT is not None
+        else 0.04
+    )
+    bb_squeeze = bb_width_pct < squeeze_threshold
 
     # +DI / -DI crossovers
     bullish_crossover = False
@@ -193,10 +199,12 @@ def _analyze_df(symbol: str, df: pd.DataFrame, use_staleness_check: bool) -> dic
                 break
 
     # Composite: trending up with momentum (AGENTS.md buy condition)
+    # RSI floor is mode-aware (was hardcoded 50 — aggressive/conservative never differed).
     rsi = latest["RSI_14"]
     macd = latest["MACD"]
     macd_sig = latest["MACD_signal"]
     sma50 = latest["SMA_50"]
+    rsi_floor = float(RSI_ENTRY_THRESHOLD) if RSI_ENTRY_THRESHOLD is not None else 50.0
     trending_up_a_lot = (
         strong_trend
         and uptrend
@@ -206,12 +214,19 @@ def _analyze_df(symbol: str, df: pd.DataFrame, use_staleness_check: bool) -> dic
         and _ok(macd_sig)
         and float(macd) > float(macd_sig)
         and _ok(rsi)
-        and float(rsi) > 50
+        and float(rsi) > rsi_floor
     )
 
-    # Similar to yesterday: |change vs prior day close| < configurable threshold
+    # Flat-market filter: require multi-day stillness, not just one quiet bar.
+    # On daily data a single sub-1% day is normal; blocking on that alone kills activity.
+    # Flag only when the move over the last ~3 sessions is still under the mode threshold.
     similar_to_yesterday = False
-    if len(df) >= 2:
+    if len(df) >= 4:
+        ref_close = df["close"].iloc[-4]
+        if _ok(ref_close) and float(ref_close) != 0:
+            pct_change = abs(close - float(ref_close)) / float(ref_close)
+            similar_to_yesterday = pct_change < SIMILAR_TO_YESTERDAY_PCT
+    elif len(df) >= 2:
         yesterday_close = df["close"].iloc[-2]
         if _ok(yesterday_close) and float(yesterday_close) != 0:
             pct_change = abs(close - float(yesterday_close)) / float(yesterday_close)
@@ -245,10 +260,16 @@ def _analyze_df(symbol: str, df: pd.DataFrame, use_staleness_check: bool) -> dic
     else:
         dead_cat_bounce = False
 
-    # Extended decline: price still >7% below 50-bar high (catching a falling knife)
+    # Extended decline: deep drawdown *and* still in a downtrend.
+    # Was 7% off the 50-bar high alone — that flags normal pullbacks in healthy trends
+    # and blocked almost every entry after any dip. Require 12% off the high + not uptrend.
     if len(df) >= 50:
         period_high_50 = float(df["high"].iloc[-50:].max())
-        extended_decline = period_high_50 > 0 and close < period_high_50 * 0.93
+        extended_decline = (
+            period_high_50 > 0
+            and close < period_high_50 * 0.88
+            and not uptrend
+        )
     else:
         extended_decline = False
 

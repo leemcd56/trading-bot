@@ -41,6 +41,7 @@ REQUIRED_KEYS = [
     "REQUIRE_ADX_RISING",
     "REQUIRE_VOLUME_CONFIRMATION",
     "LONG_TERM_SMA_PERIOD",
+    "MIN_HOLD_HOURS",
     "RISK_PCT_PER_TRADE",
     "MAX_POSITION_PCT_EQUITY",
     "MIN_SHARES",
@@ -69,6 +70,8 @@ def _patch_trade_limits():
         _get_trail_running_high=lambda symbol: None,
         _set_trail_running_high=lambda symbol, running_high: None,
         _clear_trail_state=lambda symbol: None,
+        _should_block_sell_min_hold=lambda symbol: False,
+        MIN_HOLD_HOURS=0,
     )
 
 
@@ -282,13 +285,20 @@ def test_moderate_requires_daily_filters_but_shorter_ma():
     assert mo["LONG_TERM_SMA_PERIOD"] == 100
 
 
-def test_aggressive_relaxes_most_daily_filters_but_keeps_adx_rising():
-    """Aggressive turns off volume and long-term MA (to stay aggressive) but still requires ADX rising
-    — this single filter is one of the highest-ROI improvements possible on daily bars."""
+def test_aggressive_relaxes_all_daily_compensating_filters():
+    """Aggressive turns off ADX rising, volume, and long-term MA so modes actually differ in activity."""
     ag = _load_mode("aggressive")
-    assert ag["REQUIRE_ADX_RISING"] is True
+    assert ag["REQUIRE_ADX_RISING"] is False
     assert ag["REQUIRE_VOLUME_CONFIRMATION"] is False
     assert ag["LONG_TERM_SMA_PERIOD"] == 0
+
+
+def test_min_hold_hours_ordered_by_style():
+    """Swing holds longest; aggressive can exit same day; others overnight-ish."""
+    assert _load_mode("aggressive")["MIN_HOLD_HOURS"] == 0
+    assert _load_mode("moderate")["MIN_HOLD_HOURS"] == 24
+    assert _load_mode("conservative")["MIN_HOLD_HOURS"] == 24
+    assert _load_mode("swing")["MIN_HOLD_HOURS"] == 48
 
 
 def test_swing_uses_strict_daily_filters():

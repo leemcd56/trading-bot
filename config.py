@@ -13,8 +13,27 @@ SYMBOLS = (
     if _symbols_env.strip()
     else ["AAPL", "TSLA", "GOOG", "MSFT"]
 )
-CHECK_INTERVAL_MINUTES = 60          # TA loop: once per hour is plenty with daily candles
-FMP_CHECK_INTERVAL_MINUTES = 30     # FMP signal check: every 30 min to catch intraday analyst actions early
+# Scheduler intervals (env-overridable). Defaults tuned for more timely trades:
+# - TA every 15m: fresher stops/trails + catch daily bar updates sooner
+# - FMP every 10m: analyst upgrades/downgrades are the main intraday trade source
+# Overriding still works on daily candles; sub-10m TA mostly burns API budget.
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        _log.warning("Invalid %s=%r; using default %s", name, raw, default)
+        return default
+    if value < 1:
+        _log.warning("%s=%s must be >= 1; using default %s", name, value, default)
+        return default
+    return value
+
+
+CHECK_INTERVAL_MINUTES = _env_positive_int("CHECK_INTERVAL_MINUTES", 15)
+FMP_CHECK_INTERVAL_MINUTES = _env_positive_int("FMP_CHECK_INTERVAL_MINUTES", 10)
 
 # Database: force MotherDuck (no local DuckDB fallback)
 _motherduck_token = os.getenv("MOTHERDUCK_TOKEN")
@@ -96,6 +115,10 @@ _SAFE_FALLBACKS = {
     "REQUIRE_VOLUME_CONFIRMATION": True,
     "LONG_TERM_SMA_PERIOD": 200,
 
+    # Minimum hold before discretionary TA signal exits (hours). 0 = no min hold.
+    # Stop-loss / trailing-stop always ignore this and can fire immediately.
+    "MIN_HOLD_HOURS": 24,
+
     # Position sizing — small risk; prefer ATR-based over fixed tiny notionals
     "RISK_PCT_PER_TRADE": 0.005,
     "MAX_POSITION_PCT_EQUITY": 0.08,
@@ -164,6 +187,9 @@ REQUIRE_ADX_RISING = _mode_get("REQUIRE_ADX_RISING")
 REQUIRE_VOLUME_CONFIRMATION = _mode_get("REQUIRE_VOLUME_CONFIRMATION")
 LONG_TERM_SMA_PERIOD = _mode_get("LONG_TERM_SMA_PERIOD")
 
+# Min hold before TA signal sells (stops still fire immediately)
+MIN_HOLD_HOURS = _mode_get("MIN_HOLD_HOURS")
+
 
 # ─── Post-load validation (catches broken or reckless combinations) ─────────────
 def _validate_mode_params() -> None:
@@ -224,6 +250,8 @@ def _validate_mode_params() -> None:
         problems.append("REQUIRE_VOLUME_CONFIRMATION must be a boolean")
     if LONG_TERM_SMA_PERIOD is not None and not (0 <= LONG_TERM_SMA_PERIOD <= 500):
         problems.append(f"LONG_TERM_SMA_PERIOD={LONG_TERM_SMA_PERIOD} is outside reasonable range [0, 500]")
+    if MIN_HOLD_HOURS is not None and not (0 <= MIN_HOLD_HOURS <= 168):
+        problems.append(f"MIN_HOLD_HOURS={MIN_HOLD_HOURS} is outside reasonable range [0, 168]")
 
     if problems:
         msg = "; ".join(problems)

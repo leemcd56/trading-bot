@@ -69,13 +69,12 @@ trading-bot/
 
 Conservative/swing use the strictest combination of the above. Moderate is balanced. Aggressive keeps only ADX rising as a minimal daily guardrail and relaxes the rest.
 
-**Sell / Exit Condition** (any true → consider exit)
+**Sell / Exit Condition** (confirmed exit — bare SAR alone is not enough)
 
-- `sar_above_price` or `sar_flipped_to_bear`
-- `near_lower_band` or strong bearish move
-- `dive_bombing`: downtrend + RSI < 35 + sharp drop
-- `bearish_crossover`
-- (Future: trailing stop via SAR or % loss)
+- Hard: `dive_bombing` or `sar_flipped_to_bear`
+- Confirmed: `sar_above_price` **and** not uptrend; or `near_lower_band` / `bearish_crossover` with SAR/DI confirmation
+- Risk exits always: stop-loss / trailing stop (run even without strong ADX)
+- Mode `MIN_HOLD_HOURS` blocks discretionary TA sells only (not stops): aggressive 0h, moderate/conservative 24h, swing 48h
 
 ## Important Files – Where the Logic Lives
 
