@@ -22,3 +22,15 @@ os.environ.setdefault("ALPACA_SECRET_KEY", "test-secret")
 # tests/test_ai_review.py). setdefault() means this only applies when the
 # variable isn't already set in the environment running pytest.
 os.environ.setdefault("AI_CONFIRMATION_ENABLED", "false")
+
+# alerts.py reads these at import time too, and most execute_trade/execute_signal_*
+# tests only mock trading_client (not send_alert), so without this override every
+# such test would fire a REAL Discord message / email using the developer's own
+# .env webhook and SMTP settings. setdefault() is enough here for the same reason
+# as above: conftest.py runs before any test module imports trading/alerts, so
+# this value is already in os.environ by the time alerts.py's own load_dotenv()
+# runs (which never overwrites an already-set variable).
+os.environ.setdefault("DISCORD_WEBHOOK_URL", "")
+os.environ.setdefault("ALERT_EMAIL_TO", "")
+os.environ.setdefault("ALERT_EMAIL_SMTP_URL", "")
+os.environ.setdefault("ALERT_EMAIL_FROM", "")

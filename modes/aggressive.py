@@ -24,6 +24,9 @@ PARAMS = {
 
     # Exposure limits
     "MAX_OPEN_POSITIONS": 6,      # hold up to six symbols simultaneously
+    "MAX_PORTFOLIO_RISK_PCT": 0.12,  # at most 12% of equity at risk across all open positions at once
+    "MAX_POSITION_CORRELATION": 0.9,  # barely restricts - aggressive wants to act on every signal
+    "MAX_SLIPPAGE_PCT": 0.01,  # cap qty orders 1% from the decision-time price (marketable limit)
 
     # Stop-loss / trailing stop
     "STOP_LOSS_PCT": 0.03,        # exit if position drops 3% from entry (cut fast)
@@ -54,4 +57,12 @@ PARAMS = {
     "MIN_SHARES": 1,
     "MAX_SHARES": 200,
     "NOTIONAL_PER_TRADE": 150,          # $150 per fractional buy
+
+    # Mean-reversion counter-strategy (regime switching) — OFF by default.
+    "MEAN_REVERSION_ENABLED": False,
+    "MEAN_REVERSION_ADX_CEILING": 10,          # below the already-low ADX=14 trend threshold
+    "MEAN_REVERSION_RSI_OVERSOLD": 32,
+    "MEAN_REVERSION_RSI_OVERBOUGHT": 68,
+    "MEAN_REVERSION_STOP_LOSS_PCT": 0.025,     # tighter than the already-tight 3% trend stop
+    "MEAN_REVERSION_RISK_PCT_PER_TRADE": 0.01,   # half the trend strategy's 2%
 }

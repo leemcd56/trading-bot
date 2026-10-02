@@ -5,7 +5,9 @@ Reads from trends_backtest table by default (populate via backfill.py).
 """
 import argparse
 import csv
+import statistics
 import time
+from datetime import datetime, timedelta
 import duckdb
 import pandas as pd
 from config import (
@@ -269,6 +271,82 @@ def run_backtest(
     }
 
 
+def run_walk_forward(
+    symbols: list[str],
+    start_date: str,
+    end_date: str,
+    window_days: int = 180,
+    step_days: int = 90,
+    initial_capital: float = 100_000.0,
+    table: str = DEFAULT_TABLE,
+) -> dict:
+    """
+    Split [start_date, end_date] into rolling windows of `window_days`,
+    advancing the window start by `step_days` each time, and run an
+    independent backtest (fresh capital, no parameter re-fitting) inside
+    each window.
+
+    The strategy's thresholds come from the selected TRADING_MODE, not from
+    an optimizer, so this isn't a train/optimize-then-test split — it's a
+    consistency check: does the fixed rule set hold up across many separate
+    stretches of history, or is the headline backtest number carried by one
+    lucky window? step_days < window_days overlaps windows for more samples;
+    step_days >= window_days gives non-overlapping windows.
+    """
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+
+    windows = []
+    win_start = start_dt
+    while True:
+        win_end = win_start + timedelta(days=window_days)
+        if win_end > end_dt:
+            break
+        windows.append((win_start, win_end))
+        win_start = win_start + timedelta(days=step_days)
+
+    if not windows:
+        raise ValueError(
+            f"No full {window_days}-day window fits between {start_date} and {end_date}. "
+            "Widen the date range or shrink --window-days."
+        )
+
+    results = []
+    for win_start, win_end in windows:
+        r = run_backtest(
+            symbols,
+            win_start.strftime("%Y-%m-%d"),
+            win_end.strftime("%Y-%m-%d"),
+            initial_capital=initial_capital,
+            table=table,
+        )
+        results.append({
+            "start": win_start.strftime("%Y-%m-%d"),
+            "end": win_end.strftime("%Y-%m-%d"),
+            "total_return_pct": r["total_return_pct"],
+            "max_drawdown_pct": r["max_drawdown_pct"],
+            "num_trades": r["num_trades"],
+            "win_rate": r["win_rate"],
+        })
+
+    returns = [r["total_return_pct"] for r in results]
+    n = len(returns)
+    mean_return = statistics.mean(returns)
+    std_return = statistics.pstdev(returns)
+    profitable_windows = sum(1 for x in returns if x > 0)
+
+    return {
+        "windows": results,
+        "n_windows": n,
+        "mean_return_pct": mean_return,
+        "std_return_pct": std_return,
+        "worst_return_pct": min(returns),
+        "best_return_pct": max(returns),
+        "pct_profitable_windows": profitable_windows / n * 100,
+        "worst_drawdown_pct": max(r["max_drawdown_pct"] for r in results),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Backtest strategy on historical data")
     parser.add_argument("--symbols", type=str, default="AAPL,MSFT", help="Comma-separated symbols")
@@ -277,9 +355,48 @@ def main():
     parser.add_argument("--capital", type=float, default=100_000.0, help="Initial capital")
     parser.add_argument("--table", type=str, default=DEFAULT_TABLE, help="DuckDB table with candles")
     parser.add_argument("--equity-curve", type=str, default=None, help="Optional CSV path for equity curve")
+    parser.add_argument(
+        "--walk-forward", action="store_true",
+        help="Run walk-forward analysis (rolling out-of-sample windows) instead of a single backtest",
+    )
+    parser.add_argument("--window-days", type=int, default=180, help="Walk-forward: length of each window in days")
+    parser.add_argument(
+        "--step-days", type=int, default=90,
+        help="Walk-forward: days to advance between window starts (< window-days overlaps windows)",
+    )
     args = parser.parse_args()
 
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+
+    if args.walk_forward:
+        try:
+            result = run_walk_forward(
+                symbols,
+                args.start,
+                args.end,
+                window_days=args.window_days,
+                step_days=args.step_days,
+                initial_capital=args.capital,
+                table=args.table,
+            )
+        except Exception as e:
+            logger.error(e)
+            return 1
+
+        print(f"Walk-forward results ({result['n_windows']} windows, {args.window_days}d each, {args.step_days}d step)")
+        print("-" * 72)
+        print(f"{'Window':<24}{'Return%':>10}{'MaxDD%':>9}{'Trades':>9}{'WinRate%':>10}")
+        for w in result["windows"]:
+            label = f"{w['start']} -> {w['end']}"
+            print(f"{label:<24}{w['total_return_pct']:>10.2f}{w['max_drawdown_pct']:>9.2f}{w['num_trades']:>9}{w['win_rate']:>10.1f}")
+        print("-" * 72)
+        print(f"Mean return:         {result['mean_return_pct']:.2f}%")
+        print(f"Std dev of return:   {result['std_return_pct']:.2f}%")
+        print(f"Best / worst window: {result['best_return_pct']:.2f}% / {result['worst_return_pct']:.2f}%")
+        print(f"Profitable windows:  {result['pct_profitable_windows']:.0f}%")
+        print(f"Worst drawdown seen: {result['worst_drawdown_pct']:.2f}%")
+        return 0
+
     try:
         result = run_backtest(
             symbols,

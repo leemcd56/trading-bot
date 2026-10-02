@@ -53,6 +53,13 @@ TRADE_LOG_RETAIN_DAYS = 30    # keep this many days of trade log (for daily/week
 # Not mode-specific — this is a regulatory limit.
 MAX_DAY_TRADES_IN_5_DAYS = 3
 
+# Correlation-aware position limits: lookback/sample-size are data-sufficiency
+# knobs, not risk tolerance, so they're global rather than per-mode.
+# MAX_POSITION_CORRELATION (how correlated is too correlated) IS per-mode —
+# see _mode_get below.
+CORRELATION_LOOKBACK_DAYS = 60   # daily bars of return history used to judge correlation
+CORRELATION_MIN_SAMPLES = 20     # fewer overlapping bars than this -> treat as "unknown", don't block
+
 # ─── Trading mode ────────────────────────────────────────────────────────────────
 # Set TRADING_MODE in .env (or the environment) to one of:
 #   conservative  — infrequent, high-conviction trades; build a nest egg
@@ -94,6 +101,17 @@ _SAFE_FALLBACKS = {
     "MAX_DAILY_TRADES": 1,
     "MAX_WEEKLY_TRADES": 3,
     "MAX_OPEN_POSITIONS": 2,
+    # Portfolio heat cap — max total equity at risk across ALL open positions
+    # at once (sum of qty * entry_price * STOP_LOSS_PCT / equity), independent
+    # of how many discrete positions that risk is spread across.
+    "MAX_PORTFOLIO_RISK_PCT": 0.01,
+    # How correlated a candidate's recent daily returns can be with an already-held
+    # symbol before we refuse to double up (lower = stricter diversification).
+    "MAX_POSITION_CORRELATION": 0.7,
+    # Worst price we'll accept vs. the price the decision was made on, for any
+    # qty-based order (entries + discretionary exits). Implemented as a
+    # marketable limit order, not a wider market fill.
+    "MAX_SLIPPAGE_PCT": 0.003,
 
     # Stop-loss / trailing stop — give positions breathing room
     "STOP_LOSS_PCT": 0.07,
@@ -125,6 +143,17 @@ _SAFE_FALLBACKS = {
     "MIN_SHARES": 1,
     "MAX_SHARES": 100,
     "NOTIONAL_PER_TRADE": None,  # None = use risk/ATR sizing (safer default)
+
+    # Mean-reversion counter-strategy (regime switching) — OFF unless a mode
+    # file explicitly opts in. See modes/*.py for the real per-mode values;
+    # these fallbacks exist only so a broken/incomplete mode file can't
+    # silently activate a brand-new, less battle-tested strategy.
+    "MEAN_REVERSION_ENABLED": False,
+    "MEAN_REVERSION_ADX_CEILING": 10,         # ADX must be clearly below this to call the regime "choppy"
+    "MEAN_REVERSION_RSI_OVERSOLD": 25,        # buy trigger
+    "MEAN_REVERSION_RSI_OVERBOUGHT": 75,      # take-profit trigger
+    "MEAN_REVERSION_STOP_LOSS_PCT": 0.03,     # tighter than the trend strategy's stop — chop whipsaws
+    "MEAN_REVERSION_RISK_PCT_PER_TRADE": 0.0025,  # smaller size than the trend strategy
 }
 
 
@@ -158,6 +187,9 @@ _weekly_default = _mode_get("MAX_WEEKLY_TRADES")
 MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", str(_daily_default)))
 MAX_WEEKLY_TRADES = int(os.getenv("MAX_WEEKLY_TRADES", str(_weekly_default)))
 MAX_OPEN_POSITIONS = _mode_get("MAX_OPEN_POSITIONS")
+MAX_PORTFOLIO_RISK_PCT = _mode_get("MAX_PORTFOLIO_RISK_PCT")
+MAX_POSITION_CORRELATION = _mode_get("MAX_POSITION_CORRELATION")
+MAX_SLIPPAGE_PCT = _mode_get("MAX_SLIPPAGE_PCT")
 
 # Stop-loss / trailing stop
 STOP_LOSS_PCT = _mode_get("STOP_LOSS_PCT")
@@ -190,6 +222,14 @@ LONG_TERM_SMA_PERIOD = _mode_get("LONG_TERM_SMA_PERIOD")
 # Min hold before TA signal sells (stops still fire immediately)
 MIN_HOLD_HOURS = _mode_get("MIN_HOLD_HOURS")
 
+# Mean-reversion counter-strategy (regime switching) — see modes/*.py
+MEAN_REVERSION_ENABLED = _mode_get("MEAN_REVERSION_ENABLED")
+MEAN_REVERSION_ADX_CEILING = _mode_get("MEAN_REVERSION_ADX_CEILING")
+MEAN_REVERSION_RSI_OVERSOLD = _mode_get("MEAN_REVERSION_RSI_OVERSOLD")
+MEAN_REVERSION_RSI_OVERBOUGHT = _mode_get("MEAN_REVERSION_RSI_OVERBOUGHT")
+MEAN_REVERSION_STOP_LOSS_PCT = _mode_get("MEAN_REVERSION_STOP_LOSS_PCT")
+MEAN_REVERSION_RISK_PCT_PER_TRADE = _mode_get("MEAN_REVERSION_RISK_PCT_PER_TRADE")
+
 
 # ─── Post-load validation (catches broken or reckless combinations) ─────────────
 def _validate_mode_params() -> None:
@@ -219,6 +259,47 @@ def _validate_mode_params() -> None:
     # Nonsensical caps
     if MAX_DAILY_TRADES < 0 or MAX_WEEKLY_TRADES < 0 or MAX_OPEN_POSITIONS < 0:
         problems.append("Negative trade/position caps are invalid")
+
+    # Portfolio heat cap sanity
+    if MAX_PORTFOLIO_RISK_PCT is not None and MAX_PORTFOLIO_RISK_PCT <= 0:
+        problems.append("MAX_PORTFOLIO_RISK_PCT <= 0 — no new position could ever open")
+    if MAX_PORTFOLIO_RISK_PCT is not None and MAX_PORTFOLIO_RISK_PCT > 0.5:
+        problems.append(
+            f"MAX_PORTFOLIO_RISK_PCT={MAX_PORTFOLIO_RISK_PCT} (>50% of equity at risk at once) is extremely aggressive"
+        )
+
+    # Correlation gate sanity
+    if MAX_POSITION_CORRELATION is not None and not (0 < MAX_POSITION_CORRELATION <= 1):
+        problems.append(f"MAX_POSITION_CORRELATION={MAX_POSITION_CORRELATION} is outside reasonable range (0, 1]")
+
+    # Slippage cap sanity
+    if MAX_SLIPPAGE_PCT is not None and MAX_SLIPPAGE_PCT <= 0:
+        problems.append("MAX_SLIPPAGE_PCT <= 0 — qty-based orders could never fill (limit price == reference price)")
+    if MAX_SLIPPAGE_PCT is not None and MAX_SLIPPAGE_PCT > 0.05:
+        problems.append(f"MAX_SLIPPAGE_PCT={MAX_SLIPPAGE_PCT} (>5%) barely protects against a bad fill")
+
+    # Mean-reversion counter-strategy sanity (only matters when enabled, but
+    # validate the shape regardless so a typo can't silently do something odd
+    # the moment someone flips MEAN_REVERSION_ENABLED on)
+    if not isinstance(MEAN_REVERSION_ENABLED, bool):
+        problems.append("MEAN_REVERSION_ENABLED must be a boolean")
+    if MEAN_REVERSION_ADX_CEILING is not None and not (0 < MEAN_REVERSION_ADX_CEILING < ADX_STRONG_TREND_THRESHOLD):
+        problems.append(
+            f"MEAN_REVERSION_ADX_CEILING={MEAN_REVERSION_ADX_CEILING} must be > 0 and below "
+            f"ADX_STRONG_TREND_THRESHOLD={ADX_STRONG_TREND_THRESHOLD} — otherwise the 'choppy' and "
+            "'trending' regimes overlap or invert"
+        )
+    if MEAN_REVERSION_RSI_OVERSOLD is not None and not (0 < MEAN_REVERSION_RSI_OVERSOLD < 50):
+        problems.append(f"MEAN_REVERSION_RSI_OVERSOLD={MEAN_REVERSION_RSI_OVERSOLD} must be in (0, 50)")
+    if MEAN_REVERSION_RSI_OVERBOUGHT is not None and not (50 < MEAN_REVERSION_RSI_OVERBOUGHT < 100):
+        problems.append(f"MEAN_REVERSION_RSI_OVERBOUGHT={MEAN_REVERSION_RSI_OVERBOUGHT} must be in (50, 100)")
+    if MEAN_REVERSION_STOP_LOSS_PCT is not None and MEAN_REVERSION_STOP_LOSS_PCT <= 0:
+        problems.append("MEAN_REVERSION_STOP_LOSS_PCT <= 0 — mean-reversion stop-loss would be disabled!")
+    if MEAN_REVERSION_RISK_PCT_PER_TRADE is not None and MEAN_REVERSION_RISK_PCT_PER_TRADE > 0.05:
+        problems.append(
+            f"MEAN_REVERSION_RISK_PCT_PER_TRADE={MEAN_REVERSION_RISK_PCT_PER_TRADE} (>5% per trade) is large "
+            "for a counter-trend strategy"
+        )
 
     # Aggressive-specific warnings (only when the mode is explicitly aggressive)
     if TRADING_MODE == "aggressive":

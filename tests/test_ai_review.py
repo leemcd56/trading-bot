@@ -33,6 +33,7 @@ def _buy_analysis():
         "adx_rising": True,
         "volume_confirmed": True,
         "above_long_term_ma": True,
+        "current_price": 100.0,
     }
 
 
@@ -164,6 +165,7 @@ def _patch_trade_limits():
         _set_trail_running_high=lambda symbol, running_high: None,
         _clear_trail_state=lambda symbol: None,
         _should_block_sell_min_hold=lambda symbol: False,
+        _last_buy_source=lambda symbol: None,
         MIN_HOLD_HOURS=0,
     )
 
@@ -171,6 +173,7 @@ def _patch_trade_limits():
 def test_execute_trade_skips_buy_when_ai_vetoes():
     with _patch_trade_limits(), \
          patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "_get_buying_power", return_value=100_000.0), \
          patch.object(trading, "confirm_trade", return_value={"decision": "VETO", "reasoning": "nope"}) as mock_confirm:
         mock_client.get_all_positions.return_value = []
         trading.execute_trade("TEST", _buy_analysis())
@@ -185,6 +188,7 @@ def test_execute_trade_returns_none_when_buy_vetoed():
     'no signal'."""
     with _patch_trade_limits(), \
          patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "_get_buying_power", return_value=100_000.0), \
          patch.object(trading, "confirm_trade", return_value={"decision": "VETO", "reasoning": "nope"}):
         mock_client.get_all_positions.return_value = []
         result = trading.execute_trade("TEST", _buy_analysis())
@@ -209,6 +213,7 @@ def test_ai_gate_not_consulted_when_buy_unaffordable():
 def test_execute_trade_places_buy_when_ai_confirms():
     with _patch_trade_limits(), \
          patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "_get_buying_power", return_value=100_000.0), \
          patch.object(trading, "confirm_trade", return_value={"decision": "CONFIRM", "reasoning": "ok"}):
         mock_client.get_all_positions.return_value = []
         trading.execute_trade("TEST", _buy_analysis())
@@ -248,6 +253,7 @@ def test_ai_alert_suffix_includes_reasoning_when_gate_enabled():
 def test_buy_alert_includes_ai_reasoning_when_gate_enabled():
     with _patch_trade_limits(), \
          patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "_get_buying_power", return_value=100_000.0), \
          patch.object(ai_review, "AI_CONFIRMATION_ENABLED", True), \
          patch.object(trading, "confirm_trade", return_value={"decision": "CONFIRM", "reasoning": "strong uptrend"}), \
          patch.object(trading, "_submit_order", return_value=(True, True)), \

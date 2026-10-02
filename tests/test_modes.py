@@ -26,6 +26,15 @@ REQUIRED_KEYS = [
     "MAX_DAILY_TRADES",
     "MAX_WEEKLY_TRADES",
     "MAX_OPEN_POSITIONS",
+    "MAX_PORTFOLIO_RISK_PCT",
+    "MAX_POSITION_CORRELATION",
+    "MAX_SLIPPAGE_PCT",
+    "MEAN_REVERSION_ENABLED",
+    "MEAN_REVERSION_ADX_CEILING",
+    "MEAN_REVERSION_RSI_OVERSOLD",
+    "MEAN_REVERSION_RSI_OVERBOUGHT",
+    "MEAN_REVERSION_STOP_LOSS_PCT",
+    "MEAN_REVERSION_RISK_PCT_PER_TRADE",
     "STOP_LOSS_PCT",
     "TRAIL_ACTIVATION_PCT",
     "TRAIL_PCT",
@@ -71,6 +80,7 @@ def _patch_trade_limits():
         _set_trail_running_high=lambda symbol, running_high: None,
         _clear_trail_state=lambda symbol: None,
         _should_block_sell_min_hold=lambda symbol: False,
+        _last_buy_source=lambda symbol: None,
         MIN_HOLD_HOURS=0,
     )
 
@@ -309,6 +319,24 @@ def test_swing_uses_strict_daily_filters():
     assert sw["LONG_TERM_SMA_PERIOD"] == 200
 
 
+@pytest.mark.parametrize("mode_name", ALL_MODES)
+def test_mean_reversion_ships_disabled_by_default(mode_name):
+    """
+    Safety net: the mean-reversion counter-strategy must ship OFF in every
+    built-in mode. It's a newer, less battle-tested strategy than the core
+    trend-following one - nobody should get it turned on without explicitly
+    opting in by editing a mode file or setting an env override.
+    """
+    assert _load_mode(mode_name)["MEAN_REVERSION_ENABLED"] is False
+
+
+@pytest.mark.parametrize("mode_name", ALL_MODES)
+def test_mean_reversion_adx_ceiling_below_trend_threshold(mode_name):
+    """The choppy-regime ADX ceiling must leave a dead zone below the trend threshold."""
+    params = _load_mode(mode_name)
+    assert 0 < params["MEAN_REVERSION_ADX_CEILING"] < params["ADX_STRONG_TREND_THRESHOLD"]
+
+
 # ─── 2. Config loading ────────────────────────────────────────────────────────
 
 
@@ -333,6 +361,11 @@ def test_config_params_match_mode_file(mode_name):
     expected = _load_mode(mode_name)
     cfg = _reload_config(mode_name)
     assert cfg.MAX_OPEN_POSITIONS == expected["MAX_OPEN_POSITIONS"]
+    assert cfg.MAX_PORTFOLIO_RISK_PCT == expected["MAX_PORTFOLIO_RISK_PCT"]
+    assert cfg.MAX_POSITION_CORRELATION == expected["MAX_POSITION_CORRELATION"]
+    assert cfg.MAX_SLIPPAGE_PCT == expected["MAX_SLIPPAGE_PCT"]
+    assert cfg.MEAN_REVERSION_ENABLED == expected["MEAN_REVERSION_ENABLED"]
+    assert cfg.MEAN_REVERSION_ADX_CEILING == expected["MEAN_REVERSION_ADX_CEILING"]
     assert cfg.STOP_LOSS_PCT == expected["STOP_LOSS_PCT"]
     assert cfg.TRAIL_ACTIVATION_PCT == expected["TRAIL_ACTIVATION_PCT"]
     assert cfg.TRAIL_PCT == expected["TRAIL_PCT"]

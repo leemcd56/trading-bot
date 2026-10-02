@@ -21,6 +21,9 @@ PARAMS = {
     # The remaining params are inherited from moderate; they are unused while dormant
     # but keep config valid and make the transition back to an active mode seamless.
     "MAX_OPEN_POSITIONS": 4,
+    "MAX_PORTFOLIO_RISK_PCT": 0.04,
+    "MAX_POSITION_CORRELATION": 0.75,
+    "MAX_SLIPPAGE_PCT": 0.005,
     "STOP_LOSS_PCT": 0.05,
     "TRAIL_ACTIVATION_PCT": 0.05,
     "TRAIL_PCT": 0.04,
@@ -41,4 +44,10 @@ PARAMS = {
     "MIN_SHARES": 1,
     "MAX_SHARES": 100,
     "NOTIONAL_PER_TRADE": None,
+    "MEAN_REVERSION_ENABLED": False,
+    "MEAN_REVERSION_ADX_CEILING": 14,
+    "MEAN_REVERSION_RSI_OVERSOLD": 30,
+    "MEAN_REVERSION_RSI_OVERBOUGHT": 70,
+    "MEAN_REVERSION_STOP_LOSS_PCT": 0.035,
+    "MEAN_REVERSION_RISK_PCT_PER_TRADE": 0.005,
 }

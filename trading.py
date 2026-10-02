@@ -9,7 +9,7 @@ from uuid import UUID
 import pytz
 import duckdb
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from dotenv import load_dotenv
 from utils import logger
@@ -22,6 +22,11 @@ from config import (
     MAX_DAILY_TRADES,
     MAX_WEEKLY_TRADES,
     MAX_OPEN_POSITIONS,
+    MAX_PORTFOLIO_RISK_PCT,
+    MAX_POSITION_CORRELATION,
+    CORRELATION_LOOKBACK_DAYS,
+    CORRELATION_MIN_SAMPLES,
+    MAX_SLIPPAGE_PCT,
     STOP_LOSS_PCT,
     TRADE_LOG_RETAIN_DAYS,
     DB_PATH,
@@ -40,6 +45,12 @@ from config import (
     LONG_TERM_SMA_PERIOD,
     MIN_HOLD_HOURS,
     TRADING_MODE,
+    MEAN_REVERSION_ENABLED,
+    MEAN_REVERSION_ADX_CEILING,
+    MEAN_REVERSION_RSI_OVERSOLD,
+    MEAN_REVERSION_RSI_OVERBOUGHT,
+    MEAN_REVERSION_STOP_LOSS_PCT,
+    MEAN_REVERSION_RISK_PCT_PER_TRADE,
 )
 
 load_dotenv()
@@ -58,6 +69,11 @@ trading_client = TradingClient(
     paper=_PAPER_TRADING_ENABLED,   # Change to False only when going live (very carefully!)
     url_override=_base_url if _base_url else None,
 )
+
+# "source" tag recorded in trade_history for a mean-reversion entry, so a
+# later exit check can tell which strategy opened the position (see
+# _last_buy_source / _try_risk_exit / _try_mean_reversion).
+MEAN_REVERSION_SOURCE = "mean_reversion"
 
 TRADE_LOG_TABLE = "trade_log"
 TRAIL_STATE_TABLE = "trail_state"
@@ -230,6 +246,30 @@ def _remember_pending_order(
         con.close()
 
 
+def _log_fill_slippage(symbol: str, side: str, source: str, fallback_price: float | None, fill_price: float) -> None:
+    """
+    Compare the actual fill against the price the decision was made on.
+    Only meaningful for the notional/fractional order path, which Alpaca only
+    supports as plain market orders - qty-based orders are already capped at
+    MAX_SLIPPAGE_PCT by _build_qty_order's marketable limit price, so this is
+    the only place slippage can exceed the cap.
+    """
+    if not fallback_price or fallback_price <= 0:
+        return
+    raw_pct = (fill_price - fallback_price) / fallback_price
+    # Positive = adverse (paid more on a BUY, received less on a SELL).
+    # Negative = favorable fill - never worth a warning, however large.
+    adverse_pct = raw_pct if side.upper() == "BUY" else -raw_pct
+    if adverse_pct < MAX_SLIPPAGE_PCT:
+        return
+    msg = (
+        f"{symbol} [{source}]: {side} filled at ${fill_price:.2f} vs expected ${fallback_price:.2f} "
+        f"({adverse_pct:+.2%} adverse slippage, cap is {MAX_SLIPPAGE_PCT:.1%})"
+    )
+    logger.warning(msg)
+    send_alert(msg, "error")
+
+
 def _record_order_fill_delta(
     symbol: str,
     side: str,
@@ -242,8 +282,11 @@ def _record_order_fill_delta(
     delta = max(0.0, filled_qty - recorded_qty)
     if delta <= 0:
         return 0.0
+    actual_fill_price = _to_float(getattr(order, "filled_avg_price", None))
+    if actual_fill_price is not None:
+        _log_fill_slippage(symbol, side, source, fallback_price, actual_fill_price)
     _record_trade(symbol, side, delta)
-    _record_trade_history(symbol, side, delta, _order_fill_price(order, fallback_price), source)
+    _record_trade_history(symbol, side, delta, actual_fill_price or fallback_price, source)
     return delta
 
 
@@ -533,27 +576,167 @@ def _clear_trail_state(symbol: str) -> None:
         con.close()
 
 
-def _open_positions_count() -> int | None:
+def _fetch_positions() -> list | None:
+    """
+    Single place that calls trading_client.get_all_positions(), so a caller
+    that needs more than one view of the position list (count, symbols, risk)
+    can fetch once and pass the same list around instead of each view hitting
+    the API separately. Returns None on failure.
+    """
     try:
-        positions = trading_client.get_all_positions()
-        return sum(1 for p in positions if float(p.qty) > 0)
+        return trading_client.get_all_positions()
     except Exception as e:
         logger.error(f"Failed to get positions: {e}")
         return None
 
 
-def get_open_position_symbols() -> set[str] | None:
-    """Return held symbols with positive quantity, or None on API failure."""
+def _open_positions_count(positions: list | None = None) -> int | None:
+    if positions is None:
+        positions = _fetch_positions()
+    if positions is None:
+        return None
     try:
-        positions = trading_client.get_all_positions()
+        return sum(1 for p in positions if float(p.qty) > 0)
+    except Exception as e:
+        logger.error(f"Failed to parse positions: {e}")
+        return None
+
+
+def get_open_position_symbols(positions: list | None = None) -> set[str] | None:
+    """Return held symbols with positive quantity, or None on API/parse failure."""
+    if positions is None:
+        positions = _fetch_positions()
+    if positions is None:
+        return None
+    try:
         return {
             str(p.symbol).upper()
             for p in positions
             if _to_float(getattr(p, "qty", 0)) and float(p.qty) > 0
         }
     except Exception as e:
-        logger.error(f"Failed to get positions: {e}")
+        logger.error(f"Failed to parse positions: {e}")
         return None
+
+
+def _portfolio_open_risk_pct(equity: float, positions: list | None = None) -> float | None:
+    """
+    Fraction of equity that would be lost if every currently open position
+    hit its stop-loss right now: sum(qty * avg_entry_price * STOP_LOSS_PCT) / equity.
+    Uses the same stop definition as the actual exit check in _try_risk_exit
+    (entry * (1 - STOP_LOSS_PCT)), not the ATR-widened distance used to size a
+    single new trade, so this reflects real aggregate downside across all
+    held symbols - the thing MAX_OPEN_POSITIONS (a plain headcount) can't see.
+    Returns None if positions can't be read or parsed; caller should fail closed.
+    """
+    if equity <= 0:
+        return None
+    if positions is None:
+        positions = _fetch_positions()
+    if positions is None:
+        return None
+    try:
+        total_risk = 0.0
+        for p in positions:
+            qty = _to_float(getattr(p, "qty", 0)) or 0.0
+            entry = _to_float(getattr(p, "avg_entry_price", 0)) or 0.0
+            if qty > 0 and entry > 0:
+                total_risk += qty * entry * STOP_LOSS_PCT
+        return total_risk / equity
+    except Exception as e:
+        logger.error(f"Failed to parse positions for portfolio risk check: {e}")
+        return None
+
+
+def _daily_returns(symbol: str, lookback_days: int) -> dict[int, float] | None:
+    """
+    timestamp -> daily return for `symbol`'s last `lookback_days` bars in the
+    `trends` table. Returns None on a DB read failure; returns {} (not None)
+    when the symbol simply has no/too-little history yet (e.g. never backfilled).
+    """
+    con = duckdb.connect(DB_PATH)
+    try:
+        rows = con.execute(
+            """
+            SELECT timestamp, close FROM trends
+            WHERE symbol = ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            [symbol, lookback_days + 1],
+        ).fetchall()
+    except Exception as e:
+        logger.error(f"Correlation check: failed to read history for {symbol}: {e}")
+        return None
+    finally:
+        con.close()
+
+    bars = sorted(
+        ((int(ts), float(close)) for ts, close in rows if close is not None and float(close) > 0),
+        key=lambda bar: bar[0],
+    )
+    returns: dict[int, float] = {}
+    for (ts_prev, close_prev), (ts, close) in zip(bars, bars[1:]):
+        returns[ts] = close / close_prev - 1
+    return returns
+
+
+def _pearson_correlation(xs: list[float], ys: list[float]) -> float | None:
+    n = len(xs)
+    if n < 2:
+        return None
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    var_x = sum((x - mean_x) ** 2 for x in xs)
+    var_y = sum((y - mean_y) ** 2 for y in ys)
+    if var_x <= 0 or var_y <= 0:
+        return None
+    cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    return cov / (var_x * var_y) ** 0.5
+
+
+def _correlation(
+    symbol_a: str, symbol_b: str, lookback_days: int, returns_a: dict[int, float] | None = None
+) -> float | None:
+    """
+    Pearson correlation of daily returns between two symbols, or None if
+    unknown. `returns_a` lets a caller comparing one symbol against several
+    others (see _max_correlation_with_held) pass in symbol_a's return series
+    once instead of this function re-fetching it from DuckDB on every call.
+    """
+    ret_a = returns_a if returns_a is not None else _daily_returns(symbol_a, lookback_days)
+    ret_b = _daily_returns(symbol_b, lookback_days)
+    if ret_a is None or ret_b is None or not ret_a or not ret_b:
+        return None
+    shared_ts = sorted(set(ret_a) & set(ret_b))
+    if len(shared_ts) < CORRELATION_MIN_SAMPLES:
+        return None
+    return _pearson_correlation([ret_a[t] for t in shared_ts], [ret_b[t] for t in shared_ts])
+
+
+def _max_correlation_with_held(symbol: str, held_symbols: set[str], lookback_days: int) -> float | None:
+    """
+    Highest |correlation| between `symbol` and any currently held symbol.
+    Best-effort/fail-open by design: a pair with missing or too-little shared
+    history is simply excluded rather than blocking the trade. This is a
+    diversification check, not a hard safety rail - those are the daily/
+    weekly/open-position/portfolio-heat caps in _entry_caps_allow_buy, which
+    already fail closed on real DB/API problems before this check even runs.
+    Returns None if no pair had enough data to judge.
+    """
+    # symbol's own return history doesn't change per held symbol - fetch it
+    # once rather than once per comparison (held_symbols can be several names).
+    returns_for_symbol = _daily_returns(symbol, lookback_days)
+    best = None
+    for held in held_symbols:
+        if held.upper() == symbol.upper():
+            continue
+        corr = _correlation(symbol, held, lookback_days, returns_a=returns_for_symbol)
+        if corr is None:
+            continue
+        if best is None or abs(corr) > abs(best):
+            best = corr
+    return best
 
 
 def get_locally_known_held_symbols() -> set[str] | None:
@@ -609,12 +792,35 @@ def _get_buying_power() -> float:
         return 0.0
 
 
+def _risk_based_qty(equity: float, price: float, risk_pct: float, stop_distance: float) -> int:
+    """
+    Shared core of risk-based position sizing, used by both the trend
+    strategy (_compute_buy_qty) and the mean-reversion counter-strategy
+    (_compute_mean_reversion_qty) - they differ only in which risk_pct they
+    risk and how stop_distance is derived (ATR-widened vs. a fixed stop %),
+    not in the sizing/clamping math itself.
+
+    qty = (risk_pct * equity) / stop_distance_per_share, rounded down,
+    clamped to MIN/MAX_SHARES and MAX_POSITION_PCT_EQUITY of equity.
+    """
+    if price <= 0 or equity <= 0 or stop_distance <= 0:
+        return MIN_SHARES
+    risk_amount = risk_pct * equity
+    # position_value * (stop_distance / price) = risk_amount  =>  position_value = risk_amount * price / stop_distance
+    position_value = risk_amount * price / stop_distance
+    qty = int(position_value / price)
+    max_value = MAX_POSITION_PCT_EQUITY * equity if MAX_POSITION_PCT_EQUITY else position_value
+    max_qty_by_value = int(max_value / price) if price > 0 else 0
+    qty = min(qty, max_qty_by_value, MAX_SHARES)
+    qty = max(qty, MIN_SHARES)
+    return qty
+
+
 def _compute_buy_qty(analysis: dict, equity: float) -> int:
     """
     Compute number of shares to buy using risk-based position sizing.
     Risk per trade = RISK_PCT_PER_TRADE * equity.
     Stop distance per share = max(ATR_14, current_price * STOP_LOSS_PCT).
-    qty = risk_amount / stop_distance_per_share, rounded down, clamped to MIN/MAX_SHARES and max position value.
     If RISK_PCT_PER_TRADE is None or equity/analysis invalid, returns 1.
     """
     if RISK_PCT_PER_TRADE is None or RISK_PCT_PER_TRADE <= 0:
@@ -626,17 +832,59 @@ def _compute_buy_qty(analysis: dict, equity: float) -> int:
     stop_distance = price * STOP_LOSS_PCT
     if atr is not None and atr > 0:
         stop_distance = max(stop_distance, atr)
-    if stop_distance <= 0:
+    return _risk_based_qty(equity, price, RISK_PCT_PER_TRADE, stop_distance)
+
+
+def _compute_mean_reversion_qty(analysis: dict, equity: float) -> int:
+    """
+    Risk-based sizing for the mean-reversion counter-strategy, using its own
+    (smaller) MEAN_REVERSION_RISK_PCT_PER_TRADE and its own (tighter, fixed)
+    MEAN_REVERSION_STOP_LOSS_PCT - not ATR-widened like _compute_buy_qty,
+    since mean-reversion's stop is a precise, short-term target by design,
+    not a trend-following ATR-scaled stop.
+    """
+    if MEAN_REVERSION_RISK_PCT_PER_TRADE is None or MEAN_REVERSION_RISK_PCT_PER_TRADE <= 0:
         return MIN_SHARES
-    risk_amount = RISK_PCT_PER_TRADE * equity
-    # position_value * (stop_distance / price) = risk_amount  =>  position_value = risk_amount * price / stop_distance
-    position_value = risk_amount * price / stop_distance
-    qty = int(position_value / price)
-    max_value = MAX_POSITION_PCT_EQUITY * equity if MAX_POSITION_PCT_EQUITY else position_value
-    max_qty_by_value = int(max_value / price) if price > 0 else 0
-    qty = min(qty, max_qty_by_value, MAX_SHARES)
-    qty = max(qty, MIN_SHARES)
-    return qty
+    price = analysis.get("current_price") or 0
+    if price <= 0 or equity <= 0:
+        return MIN_SHARES
+    stop_distance = price * MEAN_REVERSION_STOP_LOSS_PCT
+    return _risk_based_qty(equity, price, MEAN_REVERSION_RISK_PCT_PER_TRADE, stop_distance)
+
+
+def _mean_reversion_regime(analysis: dict) -> bool:
+    """
+    True when the market looks genuinely range-bound rather than merely
+    "not quite trending": ADX must be clearly below MEAN_REVERSION_ADX_CEILING
+    (a dead zone below ADX_STRONG_TREND_THRESHOLD where neither strategy
+    trades), and none of the avoid_long risk heuristics (dead-cat bounce,
+    extended decline, volatility spike) can be firing - those mean something
+    is wrong, not that the market is calmly ranging.
+    """
+    if analysis.get("strong_trend"):
+        return False
+    if analysis.get("avoid_long"):
+        return False
+    adx = analysis.get("adx")
+    if adx is None:
+        return False
+    return float(adx) < MEAN_REVERSION_ADX_CEILING
+
+
+def _mean_reversion_buy_signal(analysis: dict) -> bool:
+    """Oversold bounce off the lower Bollinger Band."""
+    rsi = analysis.get("rsi_14")
+    if rsi is None:
+        return False
+    return float(rsi) < MEAN_REVERSION_RSI_OVERSOLD and bool(analysis.get("near_lower_band"))
+
+
+def _mean_reversion_sell_signal(analysis: dict) -> bool:
+    """Take profit at the mean-reversion target: back to the top of the range, or RSI overbought."""
+    rsi = analysis.get("rsi_14")
+    if rsi is not None and float(rsi) > MEAN_REVERSION_RSI_OVERBOUGHT:
+        return True
+    return bool(analysis.get("near_upper_band"))
 
 
 def _last_buy_ts(symbol: str) -> float | None:
@@ -651,6 +899,32 @@ def _last_buy_ts(symbol: str) -> float | None:
         return float(out[0]) if out and out[0] is not None else None
     finally:
         con.close()
+
+
+def _last_buy_source(symbol: str) -> str | None:
+    """
+    'source' of the most recent BUY for symbol from trade_history ('ta',
+    'signal', 'mean_reversion', ...), or None if unknown/unavailable.
+    Used only to pick which exit rules apply to an open position - never a
+    hard safety gate - so any failure here degrades to None (trend rules)
+    rather than blocking or raising.
+    """
+    con = None
+    try:
+        con = duckdb.connect(DB_PATH)
+        _ensure_trade_history(con)
+        out = con.execute(
+            f"SELECT source FROM {TRADE_HISTORY_TABLE} WHERE symbol = ? AND side = 'BUY' "
+            "ORDER BY timestamp_utc DESC LIMIT 1",
+            [symbol],
+        ).fetchone()
+        return str(out[0]) if out and out[0] is not None else None
+    except Exception as e:
+        logger.warning(f"Could not look up last buy source for {symbol}: {e}")
+        return None
+    finally:
+        if con is not None:
+            con.close()
 
 
 def _held_seconds(symbol: str) -> float | None:
@@ -798,7 +1072,15 @@ def _entry_caps_allow_buy(symbol: str, source: str) -> bool:
         )
         return False
 
-    open_positions = _open_positions_count()
+    # Fetched once and shared below (open-position count, portfolio heat, and
+    # correlation all need a view of the same position list - no reason to
+    # hit the broker's get_all_positions() three separate times for one gate).
+    positions = _fetch_positions()
+    if positions is None:
+        logger.error(f"{symbol}{source}: Refusing BUY - open positions unavailable")
+        return False
+
+    open_positions = _open_positions_count(positions)
     if open_positions is None:
         logger.error(f"{symbol}{source}: Refusing BUY - open positions count unavailable")
         return False
@@ -808,7 +1090,66 @@ def _entry_caps_allow_buy(symbol: str, source: str) -> bool:
         )
         return False
 
+    equity = _get_account_equity()
+    if equity is None:
+        logger.error(f"{symbol}{source}: Refusing BUY - account equity unavailable for portfolio risk check")
+        return False
+    open_risk_pct = _portfolio_open_risk_pct(equity, positions)
+    if open_risk_pct is None:
+        logger.error(f"{symbol}{source}: Refusing BUY - portfolio open risk unavailable")
+        return False
+    if open_risk_pct >= MAX_PORTFOLIO_RISK_PCT:
+        logger.warning(
+            f"{symbol}{source}: Skipping BUY - portfolio heat at cap "
+            f"({open_risk_pct:.1%} of equity at risk >= {MAX_PORTFOLIO_RISK_PCT:.1%} cap)"
+        )
+        return False
+
+    # Correlation check is best-effort (see _max_correlation_with_held): a data
+    # gap here does NOT block the trade, unlike every check above this line.
+    held_symbols = get_open_position_symbols(positions)
+    if held_symbols:
+        max_corr = _max_correlation_with_held(symbol, held_symbols, CORRELATION_LOOKBACK_DAYS)
+        if max_corr is not None and abs(max_corr) >= MAX_POSITION_CORRELATION:
+            logger.warning(
+                f"{symbol}{source}: Skipping BUY - too correlated with an open position "
+                f"(|corr|={abs(max_corr):.2f} >= {MAX_POSITION_CORRELATION:.2f})"
+            )
+            return False
+
     return True
+
+
+def _build_qty_order(symbol: str, side: OrderSide, qty: float, reference_price: float | None):
+    """
+    Build a marketable limit order for a qty-based entry or discretionary exit,
+    capped at MAX_SLIPPAGE_PCT away from the price the decision was made on.
+    A plain market order has no protection against the live price having moved
+    since analysis ran; this bounds the worst case while still pricing to fill
+    immediately under normal liquidity.
+
+    Returns None if there is no usable reference price - callers must skip the
+    order rather than submit one with no price anchor at all.
+
+    Stop-loss and trailing-stop exits (_try_risk_exit) intentionally do NOT use
+    this: guaranteed execution matters more than price there, and a limit order
+    can fail to fill through a fast decline. Notional/fractional orders also
+    can't use this - Alpaca only supports notional on market orders - so
+    slippage there is caught after the fact by _log_fill_slippage instead.
+    """
+    if reference_price is None or reference_price <= 0:
+        return None
+    if side == OrderSide.BUY:
+        limit_price = round(reference_price * (1 + MAX_SLIPPAGE_PCT), 2)
+    else:
+        limit_price = round(reference_price * (1 - MAX_SLIPPAGE_PCT), 2)
+    return LimitOrderRequest(
+        symbol=symbol,
+        qty=qty,
+        side=side,
+        time_in_force=TimeInForce.DAY,
+        limit_price=limit_price,
+    )
 
 
 def _submit_order(
@@ -863,6 +1204,15 @@ def _try_risk_exit(symbol: str, analysis: dict) -> bool:
     Stop-loss and trailing-stop. Runs regardless of strong_trend so protection
     is never gated on ADX. Returns True when a risk-exit trigger was handled,
     even if an order could not be submitted or has not filled yet.
+
+    Strategy-aware via a per-source risk profile (see _RISK_PROFILE_DEFAULT /
+    the mean-reversion entry below): a position opened by the mean-reversion
+    counter-strategy uses its own (tighter) MEAN_REVERSION_STOP_LOSS_PCT and
+    skips the trailing stop entirely - trailing stops are a "let the winner
+    run" trend concept that fights mean-reversion's thesis of taking profit
+    at a fixed target (handled by _try_mean_reversion's own take-profit
+    check, not here). Adding a third strategy later is a new dict entry, not
+    a new branch in this function.
     """
     try:
         position = trading_client.get_open_position(symbol)
@@ -874,8 +1224,18 @@ def _try_risk_exit(symbol: str, analysis: dict) -> bool:
         if entry <= 0 or current <= 0:
             return False
 
+        # Built fresh each call (not a module-level constant) so it always
+        # reflects the current STOP_LOSS_PCT/MEAN_REVERSION_STOP_LOSS_PCT -
+        # both are live config values tests patch at runtime.
+        risk_profiles = {
+            MEAN_REVERSION_SOURCE: {"stop_loss_pct": MEAN_REVERSION_STOP_LOSS_PCT, "trailing": False},
+        }
+        default_profile = {"stop_loss_pct": STOP_LOSS_PCT, "trailing": True}
+        profile = risk_profiles.get(_last_buy_source(symbol), default_profile)
+        stop_loss_pct = profile["stop_loss_pct"]
+
         # ─── Stop-loss ───
-        if current <= entry * (1 - STOP_LOSS_PCT):
+        if current <= entry * (1 - stop_loss_pct):
             order = MarketOrderRequest(
                 symbol=symbol,
                 qty=qty,
@@ -894,7 +1254,7 @@ def _try_risk_exit(symbol: str, analysis: dict) -> bool:
                 return True
             logger.warning(
                 f"Stop-loss SELL for {symbol}: price {current:.2f} <= entry {entry:.2f} "
-                f"* (1 - {STOP_LOSS_PCT:.0%})"
+                f"* (1 - {stop_loss_pct:.0%})"
             )
             if recorded_fill:
                 send_alert(
@@ -904,6 +1264,9 @@ def _try_risk_exit(symbol: str, analysis: dict) -> bool:
             else:
                 logger.info(f"{symbol}: Stop-loss order submitted; waiting for fill before logging trade")
             return True
+
+        if not profile["trailing"]:
+            return False
 
         # ─── Trailing stop ───
         running_high = _get_trail_running_high(symbol)
@@ -977,6 +1340,125 @@ def _ai_alert_suffix(verdict: dict) -> str:
     return f" | AI: {reasoning}" if reasoning else ""
 
 
+def _try_mean_reversion(symbol: str, analysis: dict):
+    """
+    Regime-switching counter-strategy: when execute_trade finds the market
+    isn't trending, trade short-term RSI/band mean-reversion instead of
+    sitting out every choppy stretch entirely. OFF by default per mode
+    (MEAN_REVERSION_ENABLED) - returns None (today's silent skip) whenever
+    it isn't actively evaluating a choppy regime, so a mode that hasn't
+    opted in behaves exactly as before.
+
+    Shares every risk gate with the trend strategy - entry caps, portfolio
+    heat, correlation, slippage-capped limit orders, AI confirmation gate -
+    only the entry/exit signal, stop distance, and position size differ (see
+    _mean_reversion_regime / _mean_reversion_buy_signal /
+    _mean_reversion_sell_signal / _compute_mean_reversion_qty). The tighter
+    stop-loss is handled by _try_risk_exit (which runs before this, in
+    execute_trade) via _last_buy_source - not duplicated here.
+
+    Returns a truthy "no signal" string (like execute_trade's trend branch)
+    only when it actually evaluated a choppy regime with no entry signal, so
+    main.py's no-signal digest stays quiet for anyone who hasn't opted in.
+    """
+    if not MEAN_REVERSION_ENABLED:
+        logger.info(f"{symbol}: Skipping - no strong trend")
+        return None
+
+    try:
+        position = trading_client.get_open_position(symbol)
+        held_qty = float(position.qty)
+    except Exception as e:
+        if "position does not exist" not in str(e).lower() and "not found" not in str(e).lower():
+            logger.error(f"Position check failed for {symbol}: {e}")
+        held_qty = 0
+
+    if held_qty > 0:
+        if _last_buy_source(symbol) != MEAN_REVERSION_SOURCE:
+            # Held by the trend strategy; its own (wider) stop-loss via
+            # _try_risk_exit is the only protection while the market chops.
+            logger.info(f"{symbol}: Skipping - no strong trend (held by trend strategy)")
+            return None
+        if not _mean_reversion_sell_signal(analysis):
+            logger.info(
+                f"{symbol}: Holding mean-reversion position, target not hit yet "
+                f"(RSI={analysis.get('rsi_14')})"
+            )
+            return None
+
+        sell_price = analysis.get("current_price")
+        order = _build_qty_order(symbol, OrderSide.SELL, held_qty, sell_price)
+        if order is None:
+            logger.warning(f"{symbol}: Skipping mean-reversion SELL - no usable reference price for limit order")
+            return None
+        verdict = _confirm_or_alert_veto(symbol, "SELL", analysis)
+        if verdict is None:
+            return None
+        submitted, recorded_fill = _submit_order(
+            symbol=symbol,
+            order=order,
+            side="SELL",
+            source=MEAN_REVERSION_SOURCE,
+            fallback_price=sell_price,
+            failure_prefix="Mean-reversion SELL order FAILED",
+        )
+        if not submitted:
+            return None
+        logger.info(f"Mean-reversion SELL submitted for {symbol} limit=${order.limit_price:.2f}")
+        if recorded_fill:
+            send_alert(f"Mean-reversion SELL {symbol} qty={held_qty:.4g}{_ai_alert_suffix(verdict)}", "trade")
+        return None
+
+    if not _mean_reversion_regime(analysis):
+        logger.info(f"{symbol}: Skipping - no strong trend, not choppy enough for mean-reversion")
+        return None
+    if not _mean_reversion_buy_signal(analysis):
+        logger.info(f"{symbol}: Choppy regime, no mean-reversion signal (RSI={analysis.get('rsi_14')})")
+        return f"{symbol}: choppy regime, no mean-reversion signal"
+
+    if not _entry_caps_allow_buy(symbol, " [mean-reversion]"):
+        return None
+    if _would_sell_be_day_trade(symbol):
+        logger.warning(f"{symbol}: Skipping mean-reversion BUY - already purchased today")
+        return None
+
+    equity = _get_account_equity()
+    if equity is None:
+        logger.warning(f"{symbol}: Skipping mean-reversion BUY - could not fetch account equity")
+        return None
+    qty = _compute_mean_reversion_qty(analysis, equity) if equity > 0 else MIN_SHARES
+    price = analysis.get("current_price") or 0
+    order_value = qty * price
+    buying_power = _get_buying_power()
+    if order_value > 0 and buying_power < order_value:
+        logger.warning(
+            f"{symbol}: Skipping mean-reversion BUY - insufficient buying power "
+            f"(${buying_power:.2f} < ${order_value:.2f})"
+        )
+        return None
+    order = _build_qty_order(symbol, OrderSide.BUY, qty, price)
+    if order is None:
+        logger.warning(f"{symbol}: Skipping mean-reversion BUY - no usable reference price for limit order")
+        return None
+    verdict = _confirm_or_alert_veto(symbol, "BUY", analysis)
+    if verdict is None:
+        return None
+    submitted, recorded_fill = _submit_order(
+        symbol=symbol,
+        order=order,
+        side="BUY",
+        source=MEAN_REVERSION_SOURCE,
+        fallback_price=price,
+        failure_prefix="Mean-reversion BUY order FAILED",
+    )
+    if not submitted:
+        return None
+    logger.info(f"Mean-reversion BUY submitted for {symbol} qty={qty} limit=${order.limit_price:.2f}")
+    if recorded_fill:
+        send_alert(f"Mean-reversion BUY {symbol} qty={qty}{_ai_alert_suffix(verdict)}", "trade")
+    return None
+
+
 def execute_trade(symbol: str, analysis: dict | None):
     if not analysis:
         logger.info(f"{symbol}: Skipping - no analysis")
@@ -987,8 +1469,9 @@ def execute_trade(symbol: str, analysis: dict | None):
         return
 
     if not analysis.get("strong_trend", False):
-        logger.info(f"{symbol}: Skipping - no strong trend")
-        return
+        # Not trending: try the regime-switching mean-reversion counter-strategy
+        # instead of sitting out every choppy stretch (no-op when disabled).
+        return _try_mean_reversion(symbol, analysis)
 
     bullish_trigger = (
         analysis.get("bullish_crossover")
@@ -1034,15 +1517,13 @@ def execute_trade(symbol: str, analysis: dict | None):
                 # Rules engine has already formed its own BUY assumption and this
                 # specific order is affordable - only now ask the AI gate to
                 # confirm it before any order is placed.
+                order = _build_qty_order(symbol, OrderSide.BUY, 1, price)
+                if order is None:
+                    logger.warning(f"{symbol}: Skipping BUY - no usable reference price for limit order")
+                    return
                 verdict = _confirm_or_alert_veto(symbol, "BUY", analysis)
                 if verdict is None:
                     return
-                order = MarketOrderRequest(
-                    symbol=symbol,
-                    qty=1,
-                    side=OrderSide.BUY,
-                    time_in_force=TimeInForce.DAY,
-                )
                 submitted, recorded_fill = _submit_order(
                     symbol=symbol,
                     order=order,
@@ -1054,7 +1535,7 @@ def execute_trade(symbol: str, analysis: dict | None):
                 if not submitted:
                     return
                 logger.info(
-                    f"BUY submitted for {symbol} qty=1 "
+                    f"BUY submitted for {symbol} qty=1 limit=${order.limit_price:.2f} "
                     f"(whole share, price ${price:.2f} <= ${NOTIONAL_PER_TRADE})"
                 )
                 if recorded_fill:
@@ -1104,15 +1585,13 @@ def execute_trade(symbol: str, analysis: dict | None):
                     f"(${buying_power:.2f} < ${order_value:.2f})"
                 )
                 return
+            order = _build_qty_order(symbol, OrderSide.BUY, qty, price)
+            if order is None:
+                logger.warning(f"{symbol}: Skipping BUY - no usable reference price for limit order")
+                return
             verdict = _confirm_or_alert_veto(symbol, "BUY", analysis)
             if verdict is None:
                 return
-            order = MarketOrderRequest(
-                symbol=symbol,
-                qty=qty,
-                side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY,
-            )
             submitted, recorded_fill = _submit_order(
                 symbol=symbol,
                 order=order,
@@ -1123,7 +1602,7 @@ def execute_trade(symbol: str, analysis: dict | None):
             )
             if not submitted:
                 return
-            logger.info(f"BUY submitted for {symbol} qty={qty}")
+            logger.info(f"BUY submitted for {symbol} qty={qty} limit=${order.limit_price:.2f}")
             if recorded_fill:
                 send_alert(f"BUY {symbol} qty={qty}{_ai_alert_suffix(verdict)}", "trade")
 
@@ -1151,6 +1630,12 @@ def execute_trade(symbol: str, analysis: dict | None):
                     "error",
                 )
             else:
+                sell_price = analysis.get("current_price")
+                order = _build_qty_order(symbol, OrderSide.SELL, qty, sell_price)
+                if order is None:
+                    logger.warning(f"{symbol}: Skipping signal SELL - no usable reference price for limit order")
+                    return
+
                 # Rules engine has already formed its own SELL assumption above -
                 # only now ask the AI gate to confirm that specific call before
                 # any order is placed. (Stop-loss/trailing-stop exits above this
@@ -1160,23 +1645,17 @@ def execute_trade(symbol: str, analysis: dict | None):
                 if verdict is None:
                     return
 
-                order = MarketOrderRequest(
-                    symbol=symbol,
-                    qty=qty,
-                    side=OrderSide.SELL,
-                    time_in_force=TimeInForce.DAY,
-                )
                 submitted, recorded_fill = _submit_order(
                     symbol=symbol,
                     order=order,
                     side="SELL",
                     source="ta",
-                    fallback_price=analysis.get("current_price"),
+                    fallback_price=sell_price,
                     failure_prefix="SELL order FAILED",
                 )
                 if not submitted:
                     return
-                logger.info(f"SELL submitted for {symbol}")
+                logger.info(f"SELL submitted for {symbol} limit=${order.limit_price:.2f}")
                 if recorded_fill:
                     send_alert(f"SELL {symbol} qty={qty:.4g}{_ai_alert_suffix(verdict)}", "trade")
     else:
@@ -1214,9 +1693,10 @@ def execute_signal_buy(symbol: str) -> None:
         price = get_intraday_price(symbol)
         if price and price > 0 and price <= NOTIONAL_PER_TRADE and buying_power >= price:
             # Whole share when it fits inside our notional target.
-            order = MarketOrderRequest(
-                symbol=symbol, qty=1, side=OrderSide.BUY, time_in_force=TimeInForce.DAY
-            )
+            order = _build_qty_order(symbol, OrderSide.BUY, 1, price)
+            if order is None:
+                logger.warning(f"{symbol} [signal]: Skipping BUY - no usable reference price for limit order")
+                return
             submitted, recorded_fill = _submit_order(
                 symbol=symbol,
                 order=order,
@@ -1227,7 +1707,7 @@ def execute_signal_buy(symbol: str) -> None:
             )
             if not submitted:
                 return
-            logger.info(f"{symbol} [signal]: BUY submitted qty=1 (whole share @ ~${price:.2f})")
+            logger.info(f"{symbol} [signal]: BUY submitted qty=1 limit=${order.limit_price:.2f} (whole share @ ~${price:.2f})")
             if recorded_fill:
                 send_alert(f"[signal] BUY {symbol} 1 share @ ~${price:.2f}", "trade")
         else:
@@ -1255,9 +1735,10 @@ def execute_signal_buy(symbol: str) -> None:
     else:
         # Qty mode (no notional configured): buy 1 share.
         intraday_price = get_intraday_price(symbol)
-        order = MarketOrderRequest(
-            symbol=symbol, qty=1, side=OrderSide.BUY, time_in_force=TimeInForce.DAY
-        )
+        order = _build_qty_order(symbol, OrderSide.BUY, 1, intraday_price)
+        if order is None:
+            logger.warning(f"{symbol} [signal]: Skipping BUY - no usable reference price for limit order")
+            return
         submitted, recorded_fill = _submit_order(
             symbol=symbol,
             order=order,
@@ -1268,7 +1749,7 @@ def execute_signal_buy(symbol: str) -> None:
         )
         if not submitted:
             return
-        logger.info(f"{symbol} [signal]: BUY submitted qty=1")
+        logger.info(f"{symbol} [signal]: BUY submitted qty=1 limit=${order.limit_price:.2f}")
         if recorded_fill:
             send_alert(f"[signal] BUY {symbol} qty=1", "trade")
 
@@ -1310,10 +1791,11 @@ def execute_signal_sell(symbol: str) -> None:
     if qty <= 0:
         return
 
-    order = MarketOrderRequest(
-        symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY
-    )
     sell_price = get_intraday_price(symbol)
+    order = _build_qty_order(symbol, OrderSide.SELL, qty, sell_price)
+    if order is None:
+        logger.warning(f"{symbol} [signal]: Skipping SELL - no usable reference price for limit order")
+        return
     submitted, recorded_fill = _submit_order(
         symbol=symbol,
         order=order,
@@ -1324,6 +1806,6 @@ def execute_signal_sell(symbol: str) -> None:
     )
     if not submitted:
         return
-    logger.info(f"{symbol} [signal]: SELL submitted qty={qty:.4g}")
+    logger.info(f"{symbol} [signal]: SELL submitted qty={qty:.4g} limit=${order.limit_price:.2f}")
     if recorded_fill:
         send_alert(f"[signal] SELL {symbol} qty={qty:.4g}", "trade")

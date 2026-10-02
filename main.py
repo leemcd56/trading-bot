@@ -26,11 +26,15 @@ from config import (
     MAX_DAILY_TRADES,
     MAX_WEEKLY_TRADES,
     MAX_OPEN_POSITIONS,
+    MAX_PORTFOLIO_RISK_PCT,
+    MAX_POSITION_CORRELATION,
+    MAX_SLIPPAGE_PCT,
     STOP_LOSS_PCT,
     TRAIL_ACTIVATION_PCT,
     TRAIL_PCT,
     NOTIONAL_PER_TRADE,
     ADX_STRONG_TREND_THRESHOLD,
+    MEAN_REVERSION_ENABLED,
 )
 
 _ET = pytz.timezone("US/Eastern")
@@ -168,9 +172,11 @@ if __name__ == "__main__":
         f"Trading bot started | mode={TRADING_MODE.upper()} | symbols={SYMBOLS} | "
         f"ta_every={CHECK_INTERVAL_MINUTES}m fmp_every={FMP_CHECK_INTERVAL_MINUTES}m | "
         f"daily_cap={MAX_DAILY_TRADES} weekly_cap={MAX_WEEKLY_TRADES} "
-        f"max_positions={MAX_OPEN_POSITIONS} | "
+        f"max_positions={MAX_OPEN_POSITIONS} max_portfolio_risk={MAX_PORTFOLIO_RISK_PCT:.1%} "
+        f"max_corr={MAX_POSITION_CORRELATION:.2f} max_slippage={MAX_SLIPPAGE_PCT:.2%} | "
         f"stop={STOP_LOSS_PCT:.0%} trail_activate={TRAIL_ACTIVATION_PCT:.0%} trail={TRAIL_PCT:.0%} | "
-        f"notional=${NOTIONAL_PER_TRADE} adx_threshold={ADX_STRONG_TREND_THRESHOLD}"
+        f"notional=${NOTIONAL_PER_TRADE} adx_threshold={ADX_STRONG_TREND_THRESHOLD} | "
+        f"mean_reversion={'ON' if MEAN_REVERSION_ENABLED else 'off'}"
     )
     # Run both jobs immediately so we see activity right away (e.g. in Railway logs).
     fmp_job()

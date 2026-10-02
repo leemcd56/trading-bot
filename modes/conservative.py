@@ -16,6 +16,9 @@ PARAMS = {
 
     # Exposure limits
     "MAX_OPEN_POSITIONS": 2,      # never hold more than two symbols simultaneously
+    "MAX_PORTFOLIO_RISK_PCT": 0.01,  # at most 1% of equity at risk across all open positions at once
+    "MAX_POSITION_CORRELATION": 0.6,  # strict: refuse a new symbol too correlated with one already held
+    "MAX_SLIPPAGE_PCT": 0.003,  # cap qty orders 0.3% from the decision-time price (marketable limit)
 
     # Stop-loss / trailing stop
     "STOP_LOSS_PCT": 0.07,        # exit if position drops 7% from entry
@@ -45,4 +48,15 @@ PARAMS = {
     "MIN_SHARES": 1,
     "MAX_SHARES": 50,
     "NOTIONAL_PER_TRADE": 50,           # $50 per fractional buy
+
+    # Mean-reversion counter-strategy (regime switching) — OFF by default.
+    # Conservative's whole premise is "sit out anything that isn't a clear
+    # trend," so this is the strategy's intentionally strictest, smallest
+    # configuration for anyone who deliberately opts in.
+    "MEAN_REVERSION_ENABLED": False,
+    "MEAN_REVERSION_ADX_CEILING": 12,          # well below the ADX=25 trend threshold; leaves a wide dead zone
+    "MEAN_REVERSION_RSI_OVERSOLD": 25,         # stricter than the other modes' 30
+    "MEAN_REVERSION_RSI_OVERBOUGHT": 75,
+    "MEAN_REVERSION_STOP_LOSS_PCT": 0.03,      # tighter than the 7% trend stop
+    "MEAN_REVERSION_RISK_PCT_PER_TRADE": 0.0025,  # half the trend strategy's already-small 0.5%
 }

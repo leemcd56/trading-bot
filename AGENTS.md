@@ -76,6 +76,17 @@ Conservative/swing use the strictest combination of the above. Moderate is balan
 - Risk exits always: stop-loss / trailing stop (run even without strong ADX)
 - Mode `MIN_HOLD_HOURS` blocks discretionary TA sells only (not stops): aggressive 0h, moderate/conservative 24h, swing 48h
 
+**Regime-switching counter-strategy: mean-reversion** (optional, OFF by default in every mode)
+
+- When a symbol is NOT trending (`strong_trend` false), the bot used to just sit out. It can now optionally trade short-term RSI/Bollinger-Band mean-reversion in that chop instead, via `trading._try_mean_reversion` (called from `execute_trade`'s non-trending branch).
+- Regime gate (`trading._mean_reversion_regime`): `ADX < MEAN_REVERSION_ADX_CEILING` (a ceiling strictly below `ADX_STRONG_TREND_THRESHOLD`, leaving a dead zone where *neither* strategy trades) and none of the `avoid_long` risk heuristics (dead-cat bounce / extended decline / volatility spike) firing — those mean something is wrong, not that the market is calmly ranging.
+- Entry: RSI `< MEAN_REVERSION_RSI_OVERSOLD` **and** `near_lower_band`. Exit/take-profit: RSI `> MEAN_REVERSION_RSI_OVERBOUGHT` **or** `near_upper_band` (reached the top of the range).
+- Its own, smaller/tighter risk knobs per mode: `MEAN_REVERSION_RISK_PCT_PER_TRADE` (roughly half the trend strategy's) and `MEAN_REVERSION_STOP_LOSS_PCT` (tighter — chop whipsaws more than a trend pulls back). Sized by `trading._compute_mean_reversion_qty`, a fixed-%-stop version of `_compute_buy_qty` (no ATR widening — the stop is a precise short-term target by design).
+- Shares every other risk gate with the trend strategy: daily/weekly caps, `MAX_OPEN_POSITIONS`, `MAX_PORTFOLIO_RISK_PCT`, `MAX_POSITION_CORRELATION`, the slippage-capped limit order (`_build_qty_order`), and the AI confirmation gate. Only entry/exit signal, stop distance, and size differ.
+- `trading._last_buy_source` tags which strategy opened a position (via the `source` column already recorded in `trade_history`: `"ta"` vs `"mean_reversion"`), so `_try_risk_exit` can apply the right stop % and skip the trailing stop for mean-reversion positions (it takes profit at its own RSI/band target instead — a trailing stop is a "let the winner run" trend concept that fights the mean-reversion thesis). A mean-reversion position that survives into a real trend naturally falls through to trend exit rules once `strong_trend` flips true — not forced to exit early.
+- **Off by default in every built-in mode** (`MEAN_REVERSION_ENABLED: False`) — it's newer and less battle-tested than the core trend strategy. Turn it on deliberately per mode (or via env override) once you've paper-traded it and are comfortable with it; see `modes/*.py` for the per-mode values to flip.
+- Known simplification: `_portfolio_open_risk_pct` (the portfolio-heat calculation) still uses the global `STOP_LOSS_PCT` for every open position regardless of which strategy opened it, which slightly *overstates* a mean-reversion position's true risk (it actually uses the tighter `MEAN_REVERSION_STOP_LOSS_PCT`) — a safe, conservative approximation, not a bug.
+
 **AI second-opinion gate** (optional, disabled by default)
 
 - The rules engine above still forms its own BUY/SELL assumption first — nothing about the TA gates changes.
@@ -94,7 +105,7 @@ Conservative/swing use the strictest combination of the above. Moderate is balan
 - **`trading.py`**  
   → `execute_trade(symbol, analysis)`  
   → Alpaca TradingClient initialization  
-  → Buy/sell order submission logic (Market orders, qty=1 for now)  
+  → Buy/sell order submission logic: qty-based entries/discretionary exits use a marketable limit order capped at `MAX_SLIPPAGE_PCT` from the decision-time price (`_build_qty_order`); notional/fractional orders stay market orders (Alpaca only supports notional on MarketOrderRequest); stop-loss/trailing-stop exits (`_try_risk_exit`) always stay plain market orders (guaranteed execution over price). Fill slippage past the cap is logged + alerted via `_log_fill_slippage`, mainly relevant to the unprotected notional path.  
   → Calls `ai_review.confirm_trade()` before placing a TA-driven BUY/SELL order (see AI second-opinion gate above)
 
 - **`ai_review.py`**  
@@ -126,8 +137,12 @@ Conservative/swing use the strictest combination of the above. Moderate is balan
 
 - **Backtesting** — Implemented: `backfill.py` + `backtest.py`; replay historical data with current rules; measure P&L, drawdown, win rate. Run after backfilling into `trends_backtest`.
 - **Position sizing** — Implemented: `config.RISK_PCT_PER_TRADE` (e.g. 1% of equity); ATR/stop-based qty in `trading._compute_buy_qty`; set to `None` for fixed qty=1.
+- **Portfolio-level risk cap** — Implemented: `config.MAX_PORTFOLIO_RISK_PCT` caps total equity at risk across ALL open positions at once (sum of `qty * entry_price * STOP_LOSS_PCT`, computed in `trading._portfolio_open_risk_pct`), checked in `trading._entry_caps_allow_buy` alongside the daily/weekly/open-position caps. Catches the case `MAX_OPEN_POSITIONS` (a plain headcount) can't: every open slot near its max size/stop distance at the same time.
+- **Correlation-aware position limits** — Implemented: `config.MAX_POSITION_CORRELATION` (per-mode: conservative 0.6 / moderate & swing 0.75 / aggressive 0.9) refuses a new BUY whose daily-return correlation with an already-held symbol (over `CORRELATION_LOOKBACK_DAYS`, from the `trends` table) meets or exceeds the threshold — `trading._max_correlation_with_held`, checked last in `trading._entry_caps_allow_buy`. Deliberately best-effort/fail-open: unlike the daily/weekly/open-position/heat checks above it, missing or too-thin history (`CORRELATION_MIN_SAMPLES`, default 20 bars) just excludes that symbol pair rather than blocking the trade — this is a diversification check, not a hard safety rail, and the default `SYMBOLS` watchlist (AAPL/TSLA/GOOG/MSFT) won't always have deep history for every pair.
 - **Simple monitoring** — Implemented: `report.py` prints account equity, positions, unrealized P&L, daily/weekly trade counts, and recent trade log. Run on demand or on a schedule.
 - **Alerts** — Implemented: `alerts.py` sends Discord webhook messages on each trade (BUY/SELL/stop-loss) and on errors; optional email for errors only. Set `DISCORD_WEBHOOK_URL` (and optionally `ALERT_EMAIL_*`) in `.env`.
+- **Execution quality** — Implemented: `config.MAX_SLIPPAGE_PCT` caps qty-based orders at a marketable limit price (`trading._build_qty_order`); stop-loss/trailing-stop and notional/fractional orders are exempt (guaranteed execution, and an Alpaca API constraint, respectively — see `trading.py` above). Realized slippage on the unprotected notional path is logged/alerted via `trading._log_fill_slippage`. Not implemented: pre-trade spread/liquidity checks, and no awareness of open/close volatility windows.
+- **Regime switching** — Implemented, OFF by default: a mean-reversion counter-strategy trades RSI/band bounces when `strong_trend` is false and ADX says the market is genuinely choppy, instead of sitting out every non-trending stretch. See "Regime-switching counter-strategy" above for the full gate/signal/risk breakdown. Turn on deliberately per mode via `MEAN_REVERSION_ENABLED` once comfortable after paper trading it.
 
 ## Quick Commands Reminder
 

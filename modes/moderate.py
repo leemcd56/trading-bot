@@ -22,6 +22,9 @@ PARAMS = {
 
     # Exposure limits
     "MAX_OPEN_POSITIONS": 4,      # hold up to four symbols simultaneously
+    "MAX_PORTFOLIO_RISK_PCT": 0.04,  # at most 4% of equity at risk across all open positions at once
+    "MAX_POSITION_CORRELATION": 0.75,  # refuse a new symbol too correlated with one already held
+    "MAX_SLIPPAGE_PCT": 0.005,  # cap qty orders 0.5% from the decision-time price (marketable limit)
 
     # Stop-loss / trailing stop
     "STOP_LOSS_PCT": 0.05,        # exit if position drops 5% from entry
@@ -51,4 +54,17 @@ PARAMS = {
     "MIN_SHARES": 1,
     "MAX_SHARES": 100,
     "NOTIONAL_PER_TRADE": None,         # None = use RISK_PCT_PER_TRADE + ATR for proper risk sizing
+
+    # Mean-reversion counter-strategy (regime switching) — OFF by default.
+    # Trades RSI oversold bounces off the lower Bollinger Band when ADX says
+    # the market isn't trending, instead of sitting out chop entirely. Its
+    # own smaller size/tighter stop below; it shares every other risk gate
+    # (entry caps, portfolio heat, correlation, slippage cap) with the trend
+    # strategy. See trading.py's _try_mean_reversion.
+    "MEAN_REVERSION_ENABLED": False,
+    "MEAN_REVERSION_ADX_CEILING": 14,          # below the ADX=18 trend threshold; dead zone in between
+    "MEAN_REVERSION_RSI_OVERSOLD": 30,
+    "MEAN_REVERSION_RSI_OVERBOUGHT": 70,
+    "MEAN_REVERSION_STOP_LOSS_PCT": 0.035,     # tighter than the 5% trend stop
+    "MEAN_REVERSION_RISK_PCT_PER_TRADE": 0.005,  # half the trend strategy's 1%
 }

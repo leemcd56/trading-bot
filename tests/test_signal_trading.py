@@ -160,7 +160,7 @@ def _caps_ok():
         trading,
         _count_daily=lambda: 0,
         _count_weekly=lambda: 0,
-        _open_positions_count=lambda: 0,
+        _open_positions_count=lambda positions=None: 0,
         MAX_DAILY_TRADES=99,
         MAX_WEEKLY_TRADES=99,
         MAX_OPEN_POSITIONS=99,
@@ -238,6 +238,8 @@ def test_signal_buy_qty_mode_buys_one_share():
         order = mock_client.submit_order.call_args[0][0]
         assert order.side == OrderSide.BUY
         assert getattr(order, "qty", None) == 1
+        # qty-based signal buys are marketable limit orders, capped MAX_SLIPPAGE_PCT above price.
+        assert order.limit_price == pytest.approx(150.0 * (1 + trading.MAX_SLIPPAGE_PCT), abs=0.01)
 
 
 def test_signal_buy_order_failure_does_not_raise():
@@ -363,6 +365,8 @@ def test_signal_sell_submits_correct_qty():
             order = mock_client.submit_order.call_args[0][0]
             assert order.side == OrderSide.SELL
             assert float(order.qty) == 5.0
+            # qty-based signal sells are marketable limit orders, capped MAX_SLIPPAGE_PCT below price.
+            assert order.limit_price == pytest.approx(150.0 * (1 - trading.MAX_SLIPPAGE_PCT), abs=0.01)
     finally:
         os.unlink(path)
 

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 import duckdb
+import pytest
 
 # Set before importing trading so TradingClient(...) does not raise (we mock it in tests)
 os.environ["ALPACA_API_KEY"] = "test-key"
@@ -32,6 +33,7 @@ def _patch_trade_limits():
         _clear_trail_state=lambda symbol: None,
         # Allow discretionary TA sells in unit tests unless a test overrides this
         _should_block_sell_min_hold=lambda symbol: False,
+        _last_buy_source=lambda symbol: None,
         MIN_HOLD_HOURS=0,
     )
 
@@ -83,7 +85,8 @@ def test_downtrend_stays_put_no_buy():
 
 def test_all_buy_conditions_submits_buy():
     """When all buy conditions are True, submit_order(BUY) should be called."""
-    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client:
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "_get_buying_power", return_value=100_000.0):
         mock_client.get_all_positions.return_value = []  # under max open positions
         analysis = {
             "strong_trend": True,
@@ -100,16 +103,20 @@ def test_all_buy_conditions_submits_buy():
             "adx_rising": True,
             "volume_confirmed": True,
             "above_long_term_ma": True,
+            "current_price": 100.0,
         }
         trading.execute_trade("TEST", analysis)
         mock_client.submit_order.assert_called_once()
         order = mock_client.submit_order.call_args[0][0]
         assert order.side == OrderSide.BUY
+        # Entries are marketable limit orders, capped MAX_SLIPPAGE_PCT above the decision-time price.
+        assert order.limit_price == pytest.approx(100.0 * (1 + trading.MAX_SLIPPAGE_PCT), abs=0.01)
 
 
 def test_recent_bullish_signal_can_submit_buy():
     """A recent bullish confirmation should allow BUY even without same-bar crossover/flip."""
-    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client:
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "_get_buying_power", return_value=100_000.0):
         mock_client.get_all_positions.return_value = []
         analysis = {
             "strong_trend": True,
@@ -128,6 +135,7 @@ def test_recent_bullish_signal_can_submit_buy():
             "adx_rising": True,
             "volume_confirmed": True,
             "above_long_term_ma": True,
+            "current_price": 100.0,
         }
         trading.execute_trade("TEST", analysis)
         mock_client.submit_order.assert_called_once()
@@ -146,6 +154,7 @@ def test_sell_condition_submits_sell_when_position_exists():
             "sar_flipped_to_bear": False,
             "dive_bombing": False,
             "bearish_crossover": False,
+            "current_price": 100.0,
         }
         trading.execute_trade("TEST", analysis)
         # Should have called get_open_position and submit_order (sell)
@@ -153,6 +162,8 @@ def test_sell_condition_submits_sell_when_position_exists():
         mock_client.submit_order.assert_called_once()
         order = mock_client.submit_order.call_args[0][0]
         assert order.side == OrderSide.SELL
+        # Discretionary exits are marketable limit orders, capped MAX_SLIPPAGE_PCT below the decision-time price.
+        assert order.limit_price == pytest.approx(100.0 * (1 - trading.MAX_SLIPPAGE_PCT), abs=0.01)
 
 
 def test_sell_condition_no_position_does_not_submit():
@@ -699,6 +710,582 @@ def test_locally_known_held_symbols_uses_net_filled_trade_log():
     finally:
         if os.path.exists(db_file.name):
             os.unlink(db_file.name)
+
+
+def test_portfolio_open_risk_pct_sums_across_positions():
+    """Open risk = sum(qty * entry_price * STOP_LOSS_PCT) / equity across every open position."""
+    with patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "STOP_LOSS_PCT", 0.05):
+        mock_client.get_all_positions.return_value = [
+            SimpleNamespace(qty="10", avg_entry_price="100"),  # risk = 10*100*0.05 = 50
+            SimpleNamespace(qty="4", avg_entry_price="50"),    # risk = 4*50*0.05 = 10
+        ]
+        # total risk = 60, equity = 1000 -> 6%
+        assert trading._portfolio_open_risk_pct(1000.0) == pytest.approx(0.06)
+
+
+def test_portfolio_open_risk_pct_zero_when_flat():
+    """No open positions -> zero portfolio heat."""
+    with patch.object(trading, "trading_client") as mock_client:
+        mock_client.get_all_positions.return_value = []
+        assert trading._portfolio_open_risk_pct(1000.0) == 0.0
+
+
+def test_portfolio_open_risk_pct_none_on_api_failure():
+    """Fail closed (None) when positions can't be read, rather than assuming zero risk."""
+    with patch.object(trading, "trading_client") as mock_client:
+        mock_client.get_all_positions.side_effect = Exception("boom")
+        assert trading._portfolio_open_risk_pct(1000.0) is None
+
+
+def test_portfolio_open_risk_pct_none_when_equity_non_positive():
+    """Zero/negative equity can't be divided into a meaningful risk fraction."""
+    with patch.object(trading, "trading_client"):
+        assert trading._portfolio_open_risk_pct(0.0) is None
+
+
+def test_entry_caps_blocks_buy_at_portfolio_heat_cap():
+    """
+    A new BUY is refused once existing open positions already consume the
+    portfolio risk budget, even though MAX_OPEN_POSITIONS (a plain headcount)
+    would still allow another position.
+    """
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "STOP_LOSS_PCT", 0.05), \
+         patch.object(trading, "MAX_PORTFOLIO_RISK_PCT", 0.03):
+        mock_client.get_open_position.side_effect = Exception("position does not exist")
+        mock_client.get_account.return_value = SimpleNamespace(equity="10000", buying_power="10000")
+        # One existing position already risks 60*100*0.05 = 300 = 3% of 10000 equity -> at cap.
+        mock_client.get_all_positions.return_value = [
+            SimpleNamespace(qty="60", avg_entry_price="100"),
+        ]
+        analysis = {
+            "strong_trend": True,
+            "uptrend": True,
+            "trending_up_a_lot": True,
+            "near_upper_band": True,
+            "sar_below_price": True,
+            "bullish_crossover": True,
+            "sar_flipped_to_bull": False,
+            "similar_to_yesterday": False,
+            "bb_squeeze": False,
+            "avoid_long": False,
+            "adx_rising": True,
+            "volume_confirmed": True,
+            "above_long_term_ma": True,
+            "current_price": 100.0,
+        }
+        trading.execute_trade("TEST", analysis)
+        mock_client.submit_order.assert_not_called()
+
+
+def test_entry_caps_allows_buy_under_portfolio_heat_cap():
+    """Same setup, but existing open risk is well under the cap -> BUY proceeds."""
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "STOP_LOSS_PCT", 0.05), \
+         patch.object(trading, "MAX_PORTFOLIO_RISK_PCT", 0.03):
+        mock_client.get_open_position.side_effect = Exception("position does not exist")
+        mock_client.get_account.return_value = SimpleNamespace(equity="10000", buying_power="10000")
+        # Existing position risks only 1*100*0.05 = 5 = 0.05% of equity -> well under cap.
+        mock_client.get_all_positions.return_value = [
+            SimpleNamespace(qty="1", avg_entry_price="100"),
+        ]
+        analysis = {
+            "strong_trend": True,
+            "uptrend": True,
+            "trending_up_a_lot": True,
+            "near_upper_band": True,
+            "sar_below_price": True,
+            "bullish_crossover": True,
+            "sar_flipped_to_bull": False,
+            "similar_to_yesterday": False,
+            "bb_squeeze": False,
+            "avoid_long": False,
+            "adx_rising": True,
+            "volume_confirmed": True,
+            "above_long_term_ma": True,
+            "current_price": 100.0,
+        }
+        trading.execute_trade("TEST", analysis)
+        mock_client.submit_order.assert_called_once()
+        order = mock_client.submit_order.call_args[0][0]
+        assert order.side == OrderSide.BUY
+
+
+# ─── Correlation-aware position limits ───
+
+def test_pearson_correlation_perfect_positive():
+    xs = [1.0, 2.0, 3.0, 4.0, 5.0]
+    ys = [2.0, 4.0, 6.0, 8.0, 10.0]
+    assert trading._pearson_correlation(xs, ys) == pytest.approx(1.0)
+
+
+def test_pearson_correlation_perfect_negative():
+    xs = [1.0, 2.0, 3.0, 4.0, 5.0]
+    ys = [10.0, 8.0, 6.0, 4.0, 2.0]
+    assert trading._pearson_correlation(xs, ys) == pytest.approx(-1.0)
+
+
+def test_pearson_correlation_none_when_no_variance():
+    """A constant series has undefined correlation, not zero."""
+    xs = [1.0, 1.0, 1.0, 1.0]
+    ys = [1.0, 2.0, 3.0, 4.0]
+    assert trading._pearson_correlation(xs, ys) is None
+
+
+def test_pearson_correlation_needs_at_least_two_points():
+    assert trading._pearson_correlation([1.0], [2.0]) is None
+
+
+def test_max_correlation_with_held_picks_largest_absolute_value(monkeypatch):
+    """-0.85 should beat 0.3 since we care about magnitude, not direction."""
+    monkeypatch.setattr(trading, "_daily_returns", lambda symbol, lookback_days: {})
+    def fake_corr(symbol_a, symbol_b, lookback_days, returns_a=None):
+        return {"HELD1": 0.3, "HELD2": -0.85}.get(symbol_b)
+    monkeypatch.setattr(trading, "_correlation", fake_corr)
+    result = trading._max_correlation_with_held("NEW", {"HELD1", "HELD2"}, 60)
+    assert result == -0.85
+
+
+def test_max_correlation_with_held_skips_self(monkeypatch):
+    monkeypatch.setattr(trading, "_daily_returns", lambda symbol, lookback_days: {})
+    monkeypatch.setattr(trading, "_correlation", lambda a, b, lookback_days, returns_a=None: 1.0)
+    assert trading._max_correlation_with_held("AAPL", {"AAPL"}, 60) is None
+
+
+def test_max_correlation_with_held_none_when_all_unknown(monkeypatch):
+    monkeypatch.setattr(trading, "_daily_returns", lambda symbol, lookback_days: {})
+    monkeypatch.setattr(trading, "_correlation", lambda a, b, lookback_days, returns_a=None: None)
+    assert trading._max_correlation_with_held("NEW", {"HELD1", "HELD2"}, 60) is None
+
+
+def _make_trends_db(rows: list[tuple]) -> str:
+    """Create a temp DuckDB file with a `trends` table seeded with `rows`."""
+    db_file = tempfile.NamedTemporaryFile(suffix=".duckdb", delete=False)
+    db_file.close()
+    os.unlink(db_file.name)
+    con = duckdb.connect(db_file.name)
+    try:
+        con.execute("""
+            CREATE TABLE trends (
+                symbol VARCHAR, timestamp BIGINT,
+                open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, volume DOUBLE
+            )
+        """)
+        if rows:
+            con.executemany("INSERT INTO trends VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+    finally:
+        con.close()
+    return db_file.name
+
+
+def test_daily_returns_empty_for_unknown_symbol():
+    db_path = _make_trends_db([])
+    try:
+        with patch.object(trading, "DB_PATH", db_path):
+            assert trading._daily_returns("ZZZZ", lookback_days=30) == {}
+    finally:
+        os.unlink(db_path)
+
+
+def test_daily_returns_and_correlation_from_trends_table():
+    """Two symbols with identical price paths must come back perfectly correlated."""
+    rows = []
+    for i in range(25):
+        ts = i * 86400
+        price = float(100 + i)
+        rows.append(("AAA", ts, price, price, price, price, 1000.0))
+        rows.append(("BBB", ts, price, price, price, price, 1000.0))
+    db_path = _make_trends_db(rows)
+    try:
+        with patch.object(trading, "DB_PATH", db_path):
+            returns_a = trading._daily_returns("AAA", lookback_days=24)
+            assert len(returns_a) == 24
+            assert trading._correlation("AAA", "BBB", lookback_days=24) == pytest.approx(1.0)
+    finally:
+        os.unlink(db_path)
+
+
+def test_correlation_none_below_min_samples():
+    """Fewer overlapping bars than CORRELATION_MIN_SAMPLES -> unknown, not blocked."""
+    rows = []
+    for i in range(5):  # 5 bars -> 4 daily returns, well under the default 20-sample floor
+        ts = i * 86400
+        price = float(100 + i)
+        rows.append(("AAA", ts, price, price, price, price, 1000.0))
+        rows.append(("BBB", ts, price, price, price, price, 1000.0))
+    db_path = _make_trends_db(rows)
+    try:
+        with patch.object(trading, "DB_PATH", db_path):
+            assert trading._correlation("AAA", "BBB", lookback_days=60) is None
+    finally:
+        os.unlink(db_path)
+
+
+def _full_buy_analysis_at(price: float) -> dict:
+    return {
+        "strong_trend": True,
+        "uptrend": True,
+        "trending_up_a_lot": True,
+        "near_upper_band": True,
+        "sar_below_price": True,
+        "bullish_crossover": True,
+        "sar_flipped_to_bull": False,
+        "similar_to_yesterday": False,
+        "bb_squeeze": False,
+        "avoid_long": False,
+        "adx_rising": True,
+        "volume_confirmed": True,
+        "above_long_term_ma": True,
+        "current_price": price,
+    }
+
+
+def test_entry_caps_blocks_buy_correlated_with_held_position():
+    """A new BUY is refused when its recent returns are highly correlated with an already-held symbol."""
+    rows = []
+    for i in range(25):
+        ts = i * 86400
+        price = float(100 + i)
+        rows.append(("NEW", ts, price, price, price, price, 1000.0))
+        rows.append(("HELD", ts, price, price, price, price, 1000.0))  # identical path -> corr = 1.0
+    db_path = _make_trends_db(rows)
+    try:
+        with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
+             patch.object(trading, "DB_PATH", db_path), \
+             patch.object(trading, "STOP_LOSS_PCT", 0.05), \
+             patch.object(trading, "MAX_PORTFOLIO_RISK_PCT", 0.50), \
+             patch.object(trading, "MAX_POSITION_CORRELATION", 0.9), \
+             patch.object(trading, "CORRELATION_LOOKBACK_DAYS", 24):
+            mock_client.get_open_position.side_effect = Exception("position does not exist")
+            mock_client.get_account.return_value = SimpleNamespace(equity="10000", buying_power="10000")
+            mock_client.get_all_positions.return_value = [
+                SimpleNamespace(qty="1", avg_entry_price="100", symbol="HELD"),
+            ]
+            trading.execute_trade("NEW", _full_buy_analysis_at(100.0))
+            mock_client.submit_order.assert_not_called()
+    finally:
+        os.unlink(db_path)
+
+
+def test_entry_caps_allows_buy_when_correlation_under_cap():
+    """Same setup, but the correlation cap is wide enough that the trade still proceeds."""
+    rows = []
+    for i in range(25):
+        ts = i * 86400
+        price = float(100 + i)
+        rows.append(("NEW", ts, price, price, price, price, 1000.0))
+        rows.append(("HELD", ts, price, price, price, price, 1000.0))
+    db_path = _make_trends_db(rows)
+    try:
+        with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
+             patch.object(trading, "DB_PATH", db_path), \
+             patch.object(trading, "STOP_LOSS_PCT", 0.05), \
+             patch.object(trading, "MAX_PORTFOLIO_RISK_PCT", 0.50), \
+             patch.object(trading, "MAX_POSITION_CORRELATION", 1.01), \
+             patch.object(trading, "CORRELATION_LOOKBACK_DAYS", 24):
+            mock_client.get_open_position.side_effect = Exception("position does not exist")
+            mock_client.get_account.return_value = SimpleNamespace(equity="10000", buying_power="10000")
+            mock_client.get_all_positions.return_value = [
+                SimpleNamespace(qty="1", avg_entry_price="100", symbol="HELD"),
+            ]
+            trading.execute_trade("NEW", _full_buy_analysis_at(100.0))
+            mock_client.submit_order.assert_called_once()
+            order = mock_client.submit_order.call_args[0][0]
+            assert order.side == OrderSide.BUY
+    finally:
+        os.unlink(db_path)
+
+
+# ─── Execution quality: slippage-capped limit orders ───
+
+def test_build_qty_order_buy_caps_above_reference_price():
+    with patch.object(trading, "MAX_SLIPPAGE_PCT", 0.01):
+        order = trading._build_qty_order("AAPL", OrderSide.BUY, 10, 100.0)
+        assert order.limit_price == pytest.approx(101.0)
+        assert order.qty == 10
+
+
+def test_build_qty_order_sell_caps_below_reference_price():
+    with patch.object(trading, "MAX_SLIPPAGE_PCT", 0.01):
+        order = trading._build_qty_order("AAPL", OrderSide.SELL, 10, 100.0)
+        assert order.limit_price == pytest.approx(99.0)
+
+
+def test_build_qty_order_none_without_reference_price():
+    """No usable price -> no order, rather than submitting one with no anchor."""
+    assert trading._build_qty_order("AAPL", OrderSide.BUY, 1, None) is None
+    assert trading._build_qty_order("AAPL", OrderSide.BUY, 1, 0) is None
+    assert trading._build_qty_order("AAPL", OrderSide.BUY, 1, -5.0) is None
+
+
+def test_log_fill_slippage_warns_and_alerts_past_cap(monkeypatch):
+    alerts = []
+    monkeypatch.setattr(trading, "send_alert", lambda msg, kind: alerts.append((msg, kind)))
+    with patch.object(trading, "MAX_SLIPPAGE_PCT", 0.01):
+        # Bought at 103 vs an expected 100 -> 3% adverse slippage, well past the 1% cap.
+        trading._log_fill_slippage("AAPL", "BUY", "signal", 100.0, 103.0)
+    assert len(alerts) == 1
+    assert "AAPL" in alerts[0][0]
+    assert alerts[0][1] == "error"
+
+
+def test_log_fill_slippage_silent_within_cap(monkeypatch):
+    alerts = []
+    monkeypatch.setattr(trading, "send_alert", lambda msg, kind: alerts.append((msg, kind)))
+    with patch.object(trading, "MAX_SLIPPAGE_PCT", 0.01):
+        trading._log_fill_slippage("AAPL", "BUY", "signal", 100.0, 100.2)
+    assert alerts == []
+
+
+def test_log_fill_slippage_silent_on_favorable_buy_fill(monkeypatch):
+    """A BUY that fills BELOW the expected price is favorable, not adverse slippage."""
+    alerts = []
+    monkeypatch.setattr(trading, "send_alert", lambda msg, kind: alerts.append((msg, kind)))
+    with patch.object(trading, "MAX_SLIPPAGE_PCT", 0.01):
+        trading._log_fill_slippage("AAPL", "BUY", "signal", 100.0, 97.0)
+    assert alerts == []
+
+
+def test_log_fill_slippage_direction_aware_for_sells(monkeypatch):
+    """A SELL that fills ABOVE the expected price is favorable, not adverse slippage."""
+    alerts = []
+    monkeypatch.setattr(trading, "send_alert", lambda msg, kind: alerts.append((msg, kind)))
+    with patch.object(trading, "MAX_SLIPPAGE_PCT", 0.01):
+        trading._log_fill_slippage("AAPL", "SELL", "signal", 100.0, 103.0)
+    assert alerts == []
+
+
+# ─── Regime switching: mean-reversion counter-strategy ───
+
+def test_mean_reversion_regime_true_when_choppy_and_safe():
+    with patch.object(trading, "MEAN_REVERSION_ADX_CEILING", 15):
+        analysis = {"strong_trend": False, "avoid_long": False, "adx": 8.0}
+        assert trading._mean_reversion_regime(analysis) is True
+
+
+def test_mean_reversion_regime_false_when_trending():
+    with patch.object(trading, "MEAN_REVERSION_ADX_CEILING", 15):
+        analysis = {"strong_trend": True, "avoid_long": False, "adx": 8.0}
+        assert trading._mean_reversion_regime(analysis) is False
+
+
+def test_mean_reversion_regime_false_when_avoid_long():
+    """Dead-cat bounce / extended decline / volatility spike mean something is
+    wrong, not that the market is calmly ranging - never mean-revert into those."""
+    with patch.object(trading, "MEAN_REVERSION_ADX_CEILING", 15):
+        analysis = {"strong_trend": False, "avoid_long": True, "adx": 8.0}
+        assert trading._mean_reversion_regime(analysis) is False
+
+
+def test_mean_reversion_regime_false_in_dead_zone():
+    """ADX below the trend threshold but not clearly below the chop ceiling -> neither strategy fires."""
+    with patch.object(trading, "MEAN_REVERSION_ADX_CEILING", 15):
+        analysis = {"strong_trend": False, "avoid_long": False, "adx": 16.5}
+        assert trading._mean_reversion_regime(analysis) is False
+
+
+def test_mean_reversion_regime_false_when_adx_missing():
+    with patch.object(trading, "MEAN_REVERSION_ADX_CEILING", 15):
+        assert trading._mean_reversion_regime({"strong_trend": False, "avoid_long": False, "adx": None}) is False
+
+
+def test_mean_reversion_buy_signal_requires_rsi_and_band():
+    with patch.object(trading, "MEAN_REVERSION_RSI_OVERSOLD", 30):
+        assert trading._mean_reversion_buy_signal({"rsi_14": 25.0, "near_lower_band": True}) is True
+        assert trading._mean_reversion_buy_signal({"rsi_14": 35.0, "near_lower_band": True}) is False
+        assert trading._mean_reversion_buy_signal({"rsi_14": 25.0, "near_lower_band": False}) is False
+        assert trading._mean_reversion_buy_signal({"rsi_14": None, "near_lower_band": True}) is False
+
+
+def test_mean_reversion_sell_signal_on_rsi_or_band():
+    with patch.object(trading, "MEAN_REVERSION_RSI_OVERBOUGHT", 70):
+        assert trading._mean_reversion_sell_signal({"rsi_14": 75.0, "near_upper_band": False}) is True
+        assert trading._mean_reversion_sell_signal({"rsi_14": 50.0, "near_upper_band": True}) is True
+        assert trading._mean_reversion_sell_signal({"rsi_14": 50.0, "near_upper_band": False}) is False
+
+
+def test_compute_mean_reversion_qty_uses_own_risk_and_stop():
+    with patch.object(trading, "MEAN_REVERSION_RISK_PCT_PER_TRADE", 0.005), \
+         patch.object(trading, "MEAN_REVERSION_STOP_LOSS_PCT", 0.035), \
+         patch.object(trading, "MAX_POSITION_PCT_EQUITY", 0.10), \
+         patch.object(trading, "MAX_SHARES", 100), \
+         patch.object(trading, "MIN_SHARES", 1):
+        analysis = {"current_price": 50.0}
+        # risk_amount=50, stop_distance=1.75 -> position_value=1428.57 -> qty=28,
+        # capped by MAX_POSITION_PCT_EQUITY (1000/50=20) -> 20
+        qty = trading._compute_mean_reversion_qty(analysis, 10_000.0)
+        assert qty == 20
+
+
+def test_compute_mean_reversion_qty_falls_back_to_min_shares():
+    with patch.object(trading, "MEAN_REVERSION_RISK_PCT_PER_TRADE", 0.005):
+        assert trading._compute_mean_reversion_qty({"current_price": 0}, 10_000.0) == trading.MIN_SHARES
+        assert trading._compute_mean_reversion_qty({"current_price": 50.0}, 0) == trading.MIN_SHARES
+
+
+def test_last_buy_source_reads_most_recent_buy():
+    db_path = _make_trends_db([])
+    try:
+        con = duckdb.connect(db_path)
+        con.execute("""
+            CREATE TABLE trade_history (
+                timestamp_utc DOUBLE, symbol VARCHAR, side VARCHAR,
+                qty DOUBLE, price DOUBLE, source VARCHAR
+            )
+        """)
+        con.execute(
+            "INSERT INTO trade_history VALUES "
+            "(1, 'AAPL', 'BUY', 1, 100.0, 'ta'), "
+            "(2, 'AAPL', 'SELL', 1, 110.0, 'ta'), "
+            "(3, 'AAPL', 'BUY', 1, 90.0, 'mean_reversion')"
+        )
+        con.close()
+        with patch.object(trading, "DB_PATH", db_path):
+            assert trading._last_buy_source("AAPL") == "mean_reversion"
+            assert trading._last_buy_source("ZZZZ") is None
+    finally:
+        os.unlink(db_path)
+
+
+def test_last_buy_source_none_on_db_failure():
+    """Never raise - exit-rule selection must degrade gracefully, not crash _try_risk_exit."""
+    with patch.object(trading, "DB_PATH", "md:?motherduck_token=invalid-for-test"):
+        assert trading._last_buy_source("AAPL") is None
+
+
+def test_try_risk_exit_uses_tighter_stop_for_mean_reversion_position():
+    """A mean-reversion position must stop out at MEAN_REVERSION_STOP_LOSS_PCT, not the wider trend STOP_LOSS_PCT."""
+    with patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "_last_buy_source", return_value=trading.MEAN_REVERSION_SOURCE), \
+         patch.object(trading, "STOP_LOSS_PCT", 0.10), \
+         patch.object(trading, "MEAN_REVERSION_STOP_LOSS_PCT", 0.03):
+        mock_client.get_open_position.return_value = MagicMock(qty=1, avg_entry_price="100.0")
+        # 95 is within the 10% trend stop but breaches the tighter 3% mean-reversion stop.
+        analysis = {"current_price": 95.0}
+        assert trading._try_risk_exit("TEST", analysis) is True
+        mock_client.submit_order.assert_called_once()
+
+
+def test_try_risk_exit_skips_trailing_stop_for_mean_reversion_position():
+    """Mean-reversion takes profit at its own target, not via a trailing stop."""
+    with patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "_last_buy_source", return_value=trading.MEAN_REVERSION_SOURCE), \
+         patch.object(trading, "STOP_LOSS_PCT", 0.10), \
+         patch.object(trading, "MEAN_REVERSION_STOP_LOSS_PCT", 0.03), \
+         patch.object(trading, "TRAIL_ACTIVATION_PCT", 0.01), \
+         patch.object(trading, "TRAIL_PCT", 0.01), \
+         patch.object(trading, "_get_trail_running_high", return_value=110.0):
+        mock_client.get_open_position.return_value = MagicMock(qty=1, avg_entry_price="100.0")
+        # Price is above the mean-reversion stop and would normally trigger a
+        # trend trailing-stop (way below running_high), but must not for a
+        # mean-reversion position.
+        analysis = {"current_price": 105.0}
+        assert trading._try_risk_exit("TEST", analysis) is False
+        mock_client.submit_order.assert_not_called()
+
+
+def _choppy_analysis(price=50.0, rsi=20.0, near_lower=True, near_upper=False, adx=8.0):
+    return {
+        "strong_trend": False,
+        "avoid_long": False,
+        "adx": adx,
+        "rsi_14": rsi,
+        "near_lower_band": near_lower,
+        "near_upper_band": near_upper,
+        "current_price": price,
+    }
+
+
+def test_mean_reversion_disabled_by_default_takes_no_action():
+    """With MEAN_REVERSION_ENABLED left at its real (False) per-mode value, a
+    textbook oversold setup must still produce no order - today's behavior."""
+    with patch.object(trading, "trading_client") as mock_client:
+        mock_client.get_open_position.side_effect = Exception("position does not exist")
+        trading.execute_trade("TEST", _choppy_analysis())
+        mock_client.submit_order.assert_not_called()
+
+
+def test_try_mean_reversion_buy_submits_with_mean_reversion_source():
+    with patch.object(trading, "MEAN_REVERSION_ENABLED", True), \
+         patch.object(trading, "MEAN_REVERSION_ADX_CEILING", 15), \
+         patch.object(trading, "MEAN_REVERSION_RSI_OVERSOLD", 30), \
+         patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "_entry_caps_allow_buy", return_value=True), \
+         patch.object(trading, "_would_sell_be_day_trade", return_value=False), \
+         patch.object(trading, "_get_account_equity", return_value=10_000.0), \
+         patch.object(trading, "_get_buying_power", return_value=10_000.0), \
+         patch.object(trading, "_submit_order", return_value=(True, True)) as mock_submit:
+        mock_client.get_open_position.side_effect = Exception("position does not exist")
+        trading.execute_trade("TEST", _choppy_analysis())
+        mock_submit.assert_called_once()
+        kwargs = mock_submit.call_args.kwargs
+        assert kwargs["side"] == "BUY"
+        assert kwargs["source"] == trading.MEAN_REVERSION_SOURCE
+        assert kwargs["order"].side == OrderSide.BUY
+
+
+def test_try_mean_reversion_no_signal_in_dead_zone_returns_none():
+    """ADX between the chop ceiling and the trend threshold -> no action, no 'no signal' report either."""
+    with patch.object(trading, "MEAN_REVERSION_ENABLED", True), \
+         patch.object(trading, "MEAN_REVERSION_ADX_CEILING", 15), \
+         patch.object(trading, "trading_client") as mock_client:
+        mock_client.get_open_position.side_effect = Exception("position does not exist")
+        result = trading.execute_trade("TEST", _choppy_analysis(adx=16.0))
+        mock_client.submit_order.assert_not_called()
+        assert result is None
+
+
+def test_try_mean_reversion_choppy_no_signal_reports_truthy():
+    """Choppy regime but RSI hasn't hit oversold yet -> reported like the trend branch's scorecard, for the no-signal digest."""
+    with patch.object(trading, "MEAN_REVERSION_ENABLED", True), \
+         patch.object(trading, "MEAN_REVERSION_ADX_CEILING", 15), \
+         patch.object(trading, "MEAN_REVERSION_RSI_OVERSOLD", 30), \
+         patch.object(trading, "trading_client") as mock_client:
+        mock_client.get_open_position.side_effect = Exception("position does not exist")
+        result = trading.execute_trade("TEST", _choppy_analysis(rsi=45.0))
+        mock_client.submit_order.assert_not_called()
+        assert result
+
+
+def test_try_mean_reversion_ignores_position_held_by_trend_strategy():
+    """Chop + held position opened by the trend strategy -> this strategy leaves it alone entirely."""
+    with patch.object(trading, "MEAN_REVERSION_ENABLED", True), \
+         patch.object(trading, "MEAN_REVERSION_ADX_CEILING", 15), \
+         patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "_last_buy_source", return_value="ta"):
+        mock_client.get_open_position.return_value = MagicMock(qty=1, avg_entry_price="100.0")
+        # Price close to entry so the trend strategy's own stop-loss doesn't
+        # fire either - isolating that _try_mean_reversion itself takes no action.
+        trading.execute_trade("TEST", _choppy_analysis(price=98.0))
+        mock_client.submit_order.assert_not_called()
+
+
+def test_try_mean_reversion_sells_own_position_on_target_hit():
+    with patch.object(trading, "MEAN_REVERSION_ENABLED", True), \
+         patch.object(trading, "MEAN_REVERSION_RSI_OVERBOUGHT", 70), \
+         patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "_last_buy_source", return_value=trading.MEAN_REVERSION_SOURCE), \
+         patch.object(trading, "_submit_order", return_value=(True, True)) as mock_submit:
+        mock_client.get_open_position.return_value = MagicMock(qty=2, avg_entry_price="90.0")
+        analysis = _choppy_analysis(price=100.0, rsi=75.0, near_lower=False)
+        trading.execute_trade("TEST", analysis)
+        mock_submit.assert_called_once()
+        kwargs = mock_submit.call_args.kwargs
+        assert kwargs["side"] == "SELL"
+        assert kwargs["source"] == trading.MEAN_REVERSION_SOURCE
+        assert float(kwargs["order"].qty) == 2
+
+
+def test_try_mean_reversion_holds_own_position_when_target_not_hit():
+    with patch.object(trading, "MEAN_REVERSION_ENABLED", True), \
+         patch.object(trading, "MEAN_REVERSION_RSI_OVERBOUGHT", 70), \
+         patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "_last_buy_source", return_value=trading.MEAN_REVERSION_SOURCE):
+        mock_client.get_open_position.return_value = MagicMock(qty=2, avg_entry_price="90.0")
+        analysis = _choppy_analysis(price=95.0, rsi=55.0, near_lower=False, near_upper=False)
+        trading.execute_trade("TEST", analysis)
+        mock_client.submit_order.assert_not_called()
 
 
 def test_ta_sell_signal_helper():
