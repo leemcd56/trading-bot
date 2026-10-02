@@ -11,11 +11,19 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from config import DB_PATH
 from trading import trading_client, TRADE_LOG_TABLE, TRADE_HISTORY_TABLE
+from data_providers import get_daily_candles_with_failover, get_intraday_price
 
 load_dotenv()
 
 PORTFOLIO_SNAPSHOTS_TABLE = "portfolio_snapshots"
 _ET = pytz.timezone("US/Eastern")
+
+# Buy-and-hold comparison symbol for fetch_benchmark_comparison() - the honest
+# check on whether active trading is earning its complexity over the simplest
+# possible alternative. Override with BENCHMARK_SYMBOL in .env (e.g. a
+# different index fund); this is a reporting preference, not a risk
+# parameter, so it lives here rather than in the per-mode config system.
+BENCHMARK_SYMBOL = os.getenv("BENCHMARK_SYMBOL", "SPY").strip().upper() or "SPY"
 
 
 def _ensure_trade_log(con: duckdb.DuckDBPyConnection) -> None:
@@ -209,6 +217,77 @@ def _fetch_todays_snapshots() -> tuple[float | None, float | None]:
         con.close()
 
 
+def _first_portfolio_snapshot() -> tuple[float, str, float] | None:
+    """Return (timestamp_utc, date_et, equity) of the earliest recorded 'open' snapshot, or None."""
+    con = duckdb.connect(DB_PATH)
+    try:
+        _ensure_portfolio_snapshots(con)
+        row = con.execute(
+            f"SELECT timestamp_utc, date_et, equity FROM {PORTFOLIO_SNAPSHOTS_TABLE} "
+            "WHERE label = 'open' ORDER BY timestamp_utc ASC LIMIT 1"
+        ).fetchone()
+        if not row or row[2] is None or float(row[2]) <= 0:
+            return None
+        return float(row[0]), str(row[1]), float(row[2])
+    finally:
+        con.close()
+
+
+def fetch_benchmark_comparison(benchmark_symbol: str | None = None) -> dict | None:
+    """
+    Compare the bot's return since its first recorded equity snapshot against
+    a simple buy-and-hold of `benchmark_symbol` (default BENCHMARK_SYMBOL,
+    e.g. SPY) over the same span - the honest check on whether active trading
+    is earning its complexity over the simplest possible alternative.
+
+    Returns None if there's no inception snapshot yet (brand new bot), the
+    current account can't be read, or the benchmark's price history can't be
+    fetched - all data-availability gaps, not reasons to show a wrong number.
+    """
+    symbol = (benchmark_symbol or BENCHMARK_SYMBOL).strip().upper()
+
+    first_snapshot = _first_portfolio_snapshot()
+    if first_snapshot is None:
+        return None
+    inception_ts, inception_date_et, inception_equity = first_snapshot
+
+    account = fetch_account_summary()
+    if not account:
+        return None
+    current_equity = account["equity"]
+
+    lookback_days = max(int((time.time() - inception_ts) / 86400) + 5, 5)
+    candles = get_daily_candles_with_failover(symbol, lookback_days=lookback_days)
+    if candles is None or candles.empty:
+        return None
+    candles = candles.sort_values("timestamp")
+    on_or_after_inception = candles[candles["timestamp"] >= inception_ts]
+    if on_or_after_inception.empty:
+        return None
+    benchmark_start_price = float(on_or_after_inception.iloc[0]["close"])
+    if benchmark_start_price <= 0:
+        return None
+
+    benchmark_current_price = get_intraday_price(symbol)
+    if not benchmark_current_price or benchmark_current_price <= 0:
+        benchmark_current_price = float(candles.iloc[-1]["close"])
+
+    bot_return_pct = (current_equity - inception_equity) / inception_equity * 100
+    benchmark_return_pct = (benchmark_current_price - benchmark_start_price) / benchmark_start_price * 100
+
+    return {
+        "benchmark_symbol": symbol,
+        "inception_date_et": inception_date_et,
+        "inception_equity": inception_equity,
+        "current_equity": current_equity,
+        "bot_return_pct": bot_return_pct,
+        "benchmark_start_price": benchmark_start_price,
+        "benchmark_current_price": benchmark_current_price,
+        "benchmark_return_pct": benchmark_return_pct,
+        "alpha_pct": bot_return_pct - benchmark_return_pct,
+    }
+
+
 def send_eod_summary() -> None:
     """Build and send an end-of-day Discord embed summarising trades and portfolio performance."""
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
@@ -233,6 +312,18 @@ def send_eod_summary() -> None:
         lines.append(f"💰 **Portfolio at close:** ${close_equity:,.2f}")
     elif open_equity:
         lines.append(f"💰 **Portfolio at open:** ${open_equity:,.2f}")
+
+    # Since-inception benchmark comparison - is active trading beating a simple buy-and-hold?
+    benchmark = fetch_benchmark_comparison()
+    if benchmark:
+        sign_bot = "+" if benchmark["bot_return_pct"] >= 0 else ""
+        sign_bm = "+" if benchmark["benchmark_return_pct"] >= 0 else ""
+        sign_alpha = "+" if benchmark["alpha_pct"] >= 0 else ""
+        lines.append(
+            f"📐 **Since {benchmark['inception_date_et']}:** Bot {sign_bot}{benchmark['bot_return_pct']:.2f}% "
+            f"vs {benchmark['benchmark_symbol']} (buy & hold) {sign_bm}{benchmark['benchmark_return_pct']:.2f}% "
+            f"({sign_alpha}{benchmark['alpha_pct']:.2f} pts)"
+        )
 
     # Today's trades
     lines.append("")
@@ -321,6 +412,19 @@ def print_report():
         for ts, symbol, side in recent[:10]:
             dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
             print(f"  {dt}  {side:4}  {symbol}")
+    print()
+    benchmark = fetch_benchmark_comparison()
+    print(f"Since inception (vs. buy-and-hold {benchmark['benchmark_symbol'] if benchmark else BENCHMARK_SYMBOL})")
+    if benchmark:
+        sign_bot = "+" if benchmark["bot_return_pct"] >= 0 else ""
+        sign_bm = "+" if benchmark["benchmark_return_pct"] >= 0 else ""
+        sign_alpha = "+" if benchmark["alpha_pct"] >= 0 else ""
+        print(f"  Since:         {benchmark['inception_date_et']}")
+        print(f"  Bot return:    {sign_bot}{benchmark['bot_return_pct']:.2f}%")
+        print(f"  {benchmark['benchmark_symbol']} return:    {sign_bm}{benchmark['benchmark_return_pct']:.2f}%")
+        print(f"  Difference:    {sign_alpha}{benchmark['alpha_pct']:.2f} pts")
+    else:
+        print("  (not enough data yet - need at least one recorded equity snapshot and a reachable price feed)")
     print("=" * 50)
 
 
