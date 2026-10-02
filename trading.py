@@ -77,6 +77,11 @@ trading_client = TradingClient(
 # _last_buy_source / _try_risk_exit / _try_mean_reversion).
 MEAN_REVERSION_SOURCE = "mean_reversion"
 
+# IRS wash-sale rule: a loss is disallowed if the same (or substantially
+# identical) security is bought within 30 days before or after the loss sale.
+# See _wash_sale_risk for which direction this bot actually checks.
+WASH_SALE_WINDOW_DAYS = 30
+
 TRADE_LOG_TABLE = "trade_log"
 TRAIL_STATE_TABLE = "trail_state"
 TRADE_HISTORY_TABLE = "trade_history"
@@ -299,6 +304,141 @@ def _log_fill_slippage(symbol: str, side: str, source: str, fallback_price: floa
     send_alert(msg, "error")
 
 
+def _fifo_cost_basis(symbol: str, before_ts: float, qty_needed: float) -> float | None:
+    """
+    Average cost per share for the oldest `qty_needed` currently-open shares
+    of `symbol`, replaying trade_history in timestamp order (FIFO) up to (but
+    not including) `before_ts`. trade_history is never pruned, so this has
+    the bot's full history for the symbol to work with.
+
+    Returns None if there isn't enough open BUY history to cover
+    `qty_needed` - e.g. a position opened before the bot started recording,
+    or opened manually in Alpaca. A wash-sale check with no real cost basis
+    would just be a guess, so callers must skip rather than flag in that case.
+    """
+    con = None
+    try:
+        con = duckdb.connect(DB_PATH)
+        _ensure_trade_history(con)
+        rows = con.execute(
+            f"SELECT side, qty, price FROM {TRADE_HISTORY_TABLE} "
+            "WHERE symbol = ? AND timestamp_utc < ? ORDER BY timestamp_utc ASC",
+            [symbol, before_ts],
+        ).fetchall()
+    except Exception as e:
+        logger.warning(f"Could not read trade history for FIFO cost basis on {symbol}: {e}")
+        return None
+    finally:
+        if con is not None:
+            con.close()
+
+    open_lots: list[list[float]] = []  # [[qty, price], ...] oldest first
+    for side, qty, price in rows:
+        qty = _to_float(qty) or 0.0
+        price = _to_float(price) or 0.0
+        if qty <= 0:
+            continue
+        if side == "BUY":
+            open_lots.append([qty, price])
+        elif side == "SELL":
+            remaining = qty
+            while remaining > 1e-9 and open_lots:
+                lot = open_lots[0]
+                take = min(lot[0], remaining)
+                lot[0] -= take
+                remaining -= take
+                if lot[0] <= 1e-9:
+                    open_lots.pop(0)
+
+    remaining_needed = qty_needed
+    total_cost = 0.0
+    for lot_qty, lot_price in open_lots:
+        if remaining_needed <= 1e-9:
+            break
+        take = min(lot_qty, remaining_needed)
+        total_cost += take * lot_price
+        remaining_needed -= take
+
+    if remaining_needed > 1e-6:
+        return None
+    return total_cost / qty_needed
+
+
+def _wash_sale_risk(symbol: str, buy_ts: float) -> dict | None:
+    """
+    Checks whether a BUY happening now would trigger a wash sale: the IRS
+    disallows a loss if you buy the same security back within 30 days of
+    selling it at a loss. This only checks that one direction - "did I just
+    sell this at a loss, and am I now buying it back" - not a prior buy
+    shortly before an upcoming loss sale. The latter would require guessing
+    which shares are "replacement" shares at the moment they're bought,
+    before we know a later sale will even be at a loss; this direction is
+    unambiguous because the position is flat (fully closed) at the loss
+    sale, so any later buy is clearly a new, separate purchase. This is a
+    lightweight heuristic flag for awareness, not tax advice - it never
+    blocks or alters the BUY that already happened.
+
+    Returns a dict describing the prior loss sale if one is found within
+    WASH_SALE_WINDOW_DAYS, else None (no recent loss sale, the recent sale
+    wasn't a loss, or there isn't enough trade history to tell).
+    """
+    con = None
+    try:
+        con = duckdb.connect(DB_PATH)
+        _ensure_trade_history(con)
+        window_start = buy_ts - WASH_SALE_WINDOW_DAYS * 86400
+        row = con.execute(
+            f"SELECT timestamp_utc, qty, price FROM {TRADE_HISTORY_TABLE} "
+            "WHERE symbol = ? AND side = 'SELL' AND timestamp_utc >= ? AND timestamp_utc < ? "
+            "ORDER BY timestamp_utc DESC LIMIT 1",
+            [symbol, window_start, buy_ts],
+        ).fetchone()
+    except Exception as e:
+        logger.warning(f"Could not check wash-sale risk for {symbol}: {e}")
+        return None
+    finally:
+        if con is not None:
+            con.close()
+
+    if not row:
+        return None
+    sell_ts, sell_qty, sell_price = row
+    sell_qty = _to_float(sell_qty) or 0.0
+    sell_price = _to_float(sell_price) or 0.0
+    if sell_qty <= 0 or sell_price <= 0:
+        return None
+
+    cost_basis = _fifo_cost_basis(symbol, sell_ts, sell_qty)
+    if cost_basis is None or sell_price >= cost_basis:
+        return None
+
+    return {
+        "sell_date_et": datetime.fromtimestamp(sell_ts, tz=_ET).strftime("%Y-%m-%d"),
+        "sell_price": sell_price,
+        "cost_basis": cost_basis,
+        "loss_amount": (cost_basis - sell_price) * sell_qty,
+    }
+
+
+def _check_wash_sale_risk(symbol: str, buy_ts: float) -> None:
+    """
+    Informational only - called after a BUY has already filled, never blocks
+    or delays a trade. Logs + alerts once per matching loss sale found, so a
+    held position that triggers no further buys doesn't generate noise.
+    """
+    risk = _wash_sale_risk(symbol, buy_ts)
+    if risk is None:
+        return
+    msg = (
+        f"⚠️ Possible wash sale: {symbol} bought back within {WASH_SALE_WINDOW_DAYS} days of a "
+        f"${risk['loss_amount']:,.2f} loss sale on {risk['sell_date_et']} (sold @ ${risk['sell_price']:.2f}, "
+        f"cost basis ${risk['cost_basis']:.2f}). That loss may be disallowed for this tax year - "
+        f"it gets added to this new position's cost basis instead. Not tax advice; consult a professional."
+    )
+    logger.warning(msg)
+    send_alert(msg, "error")
+
+
 def _record_order_fill_delta(
     symbol: str,
     side: str,
@@ -316,6 +456,8 @@ def _record_order_fill_delta(
         _log_fill_slippage(symbol, side, source, fallback_price, actual_fill_price)
     _record_trade(symbol, side, delta)
     _record_trade_history(symbol, side, delta, actual_fill_price or fallback_price, source)
+    if side.upper() == "BUY":
+        _check_wash_sale_risk(symbol, time.time())
     return delta
 
 

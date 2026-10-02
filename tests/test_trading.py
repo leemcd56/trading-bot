@@ -3,6 +3,7 @@ Tests for execute_trade: mock Alpaca client and assert buy/sell/no-op decisions.
 """
 import os
 import tempfile
+import time
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
@@ -1161,6 +1162,172 @@ def test_last_buy_source_none_on_db_failure():
     """Never raise - exit-rule selection must degrade gracefully, not crash _try_risk_exit."""
     with patch.object(trading, "DB_PATH", "md:?motherduck_token=invalid-for-test"):
         assert trading._last_buy_source("AAPL") is None
+
+
+# ─── Wash-sale flag ───
+
+def _make_trade_history_db(rows: list[tuple]) -> str:
+    """Temp DuckDB file with a trade_history table seeded with rows."""
+    db_path = _make_trends_db([])
+    con = duckdb.connect(db_path)
+    try:
+        con.execute("""
+            CREATE TABLE trade_history (
+                timestamp_utc DOUBLE, symbol VARCHAR, side VARCHAR,
+                qty DOUBLE, price DOUBLE, source VARCHAR
+            )
+        """)
+        if rows:
+            con.executemany("INSERT INTO trade_history VALUES (?, ?, ?, ?, ?, ?)", rows)
+    finally:
+        con.close()
+    return db_path
+
+
+def test_fifo_cost_basis_single_lot():
+    db_path = _make_trade_history_db([
+        (1.0, "AAPL", "BUY", 10.0, 100.0, "ta"),
+    ])
+    try:
+        with patch.object(trading, "DB_PATH", db_path):
+            assert trading._fifo_cost_basis("AAPL", before_ts=100.0, qty_needed=10.0) == pytest.approx(100.0)
+    finally:
+        os.unlink(db_path)
+
+
+def test_fifo_cost_basis_averages_across_multiple_buys_oldest_first():
+    db_path = _make_trade_history_db([
+        (1.0, "AAPL", "BUY", 10.0, 100.0, "ta"),
+        (2.0, "AAPL", "BUY", 10.0, 120.0, "ta"),
+    ])
+    try:
+        with patch.object(trading, "DB_PATH", db_path):
+            # Needs 15 shares: all 10 @ 100 + 5 @ 120 -> (1000 + 600) / 15
+            assert trading._fifo_cost_basis("AAPL", before_ts=100.0, qty_needed=15.0) == pytest.approx(1600.0 / 15)
+    finally:
+        os.unlink(db_path)
+
+
+def test_fifo_cost_basis_consumes_lots_on_prior_sells():
+    db_path = _make_trade_history_db([
+        (1.0, "AAPL", "BUY", 10.0, 100.0, "ta"),   # fully sold below
+        (2.0, "AAPL", "SELL", 10.0, 105.0, "ta"),
+        (3.0, "AAPL", "BUY", 10.0, 150.0, "ta"),   # the only open lot by before_ts
+    ])
+    try:
+        with patch.object(trading, "DB_PATH", db_path):
+            assert trading._fifo_cost_basis("AAPL", before_ts=100.0, qty_needed=10.0) == pytest.approx(150.0)
+    finally:
+        os.unlink(db_path)
+
+
+def test_fifo_cost_basis_none_when_insufficient_history():
+    db_path = _make_trade_history_db([
+        (1.0, "AAPL", "BUY", 5.0, 100.0, "ta"),
+    ])
+    try:
+        with patch.object(trading, "DB_PATH", db_path):
+            assert trading._fifo_cost_basis("AAPL", before_ts=100.0, qty_needed=10.0) is None
+    finally:
+        os.unlink(db_path)
+
+
+def test_wash_sale_risk_flags_rebuy_after_recent_loss():
+    now = time.time()
+    db_path = _make_trade_history_db([
+        (now - 10 * 86400, "AAPL", "BUY", 10.0, 100.0, "ta"),
+        (now - 5 * 86400, "AAPL", "SELL", 10.0, 90.0, "ta"),  # loss of $100
+    ])
+    try:
+        with patch.object(trading, "DB_PATH", db_path):
+            risk = trading._wash_sale_risk("AAPL", buy_ts=now)
+        assert risk is not None
+        assert risk["loss_amount"] == pytest.approx(100.0)
+        assert risk["sell_price"] == pytest.approx(90.0)
+        assert risk["cost_basis"] == pytest.approx(100.0)
+    finally:
+        os.unlink(db_path)
+
+
+def test_wash_sale_risk_none_when_prior_sale_was_a_gain():
+    now = time.time()
+    db_path = _make_trade_history_db([
+        (now - 10 * 86400, "AAPL", "BUY", 10.0, 100.0, "ta"),
+        (now - 5 * 86400, "AAPL", "SELL", 10.0, 110.0, "ta"),  # gain, not a loss
+    ])
+    try:
+        with patch.object(trading, "DB_PATH", db_path):
+            assert trading._wash_sale_risk("AAPL", buy_ts=now) is None
+    finally:
+        os.unlink(db_path)
+
+
+def test_wash_sale_risk_none_when_sale_outside_window():
+    now = time.time()
+    db_path = _make_trade_history_db([
+        (now - 40 * 86400, "AAPL", "BUY", 10.0, 100.0, "ta"),
+        (now - 35 * 86400, "AAPL", "SELL", 10.0, 90.0, "ta"),  # loss, but > 30 days ago
+    ])
+    try:
+        with patch.object(trading, "DB_PATH", db_path):
+            assert trading._wash_sale_risk("AAPL", buy_ts=now) is None
+    finally:
+        os.unlink(db_path)
+
+
+def test_wash_sale_risk_none_when_no_prior_sale():
+    db_path = _make_trade_history_db([])
+    try:
+        with patch.object(trading, "DB_PATH", db_path):
+            assert trading._wash_sale_risk("AAPL", buy_ts=time.time()) is None
+    finally:
+        os.unlink(db_path)
+
+
+def test_wash_sale_risk_none_when_cost_basis_unknown():
+    """A loss-looking sale with no matching buy history must not guess -> no flag."""
+    now = time.time()
+    db_path = _make_trade_history_db([
+        (now - 5 * 86400, "AAPL", "SELL", 10.0, 90.0, "ta"),  # no prior BUY at all
+    ])
+    try:
+        with patch.object(trading, "DB_PATH", db_path):
+            assert trading._wash_sale_risk("AAPL", buy_ts=now) is None
+    finally:
+        os.unlink(db_path)
+
+
+def test_check_wash_sale_risk_alerts_when_flagged(monkeypatch):
+    alerts = []
+    monkeypatch.setattr(trading, "send_alert", lambda msg, kind: alerts.append((msg, kind)))
+    monkeypatch.setattr(
+        trading, "_wash_sale_risk",
+        lambda symbol, buy_ts: {"sell_date_et": "2026-01-01", "sell_price": 90.0, "cost_basis": 100.0, "loss_amount": 100.0},
+    )
+    trading._check_wash_sale_risk("AAPL", time.time())
+    assert len(alerts) == 1
+    assert "wash sale" in alerts[0][0].lower()
+    assert "AAPL" in alerts[0][0]
+    assert alerts[0][1] == "error"
+
+
+def test_check_wash_sale_risk_silent_when_not_flagged(monkeypatch):
+    alerts = []
+    monkeypatch.setattr(trading, "send_alert", lambda msg, kind: alerts.append((msg, kind)))
+    monkeypatch.setattr(trading, "_wash_sale_risk", lambda symbol, buy_ts: None)
+    trading._check_wash_sale_risk("AAPL", time.time())
+    assert alerts == []
+
+
+def test_record_order_fill_delta_checks_wash_sale_only_on_buy(monkeypatch):
+    calls = []
+    monkeypatch.setattr(trading, "_check_wash_sale_risk", lambda symbol, buy_ts: calls.append(symbol))
+    with patch.object(trading, "_record_trade"), \
+         patch.object(trading, "_record_trade_history"):
+        order = SimpleNamespace(filled_qty="1", filled_avg_price="100.0")
+        trading._record_order_fill_delta("AAPL", "BUY", "ta", 100.0, order, 0.0)
+        trading._record_order_fill_delta("AAPL", "SELL", "ta", 100.0, order, 0.0)
+    assert calls == ["AAPL"]
 
 
 def test_try_risk_exit_uses_tighter_stop_for_mean_reversion_position():
