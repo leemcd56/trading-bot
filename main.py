@@ -4,7 +4,15 @@ import schedule
 import pytz
 from data_fetch import fetch_and_store, prune_old_trends
 from analysis import analyze_trends
-from trading import execute_trade, execute_signal_buy, execute_signal_sell, prune_old_trade_log
+from trading import (
+    execute_trade,
+    execute_signal_buy,
+    execute_signal_sell,
+    get_locally_known_held_symbols,
+    get_open_position_symbols,
+    prune_old_trade_log,
+    reconcile_pending_orders,
+)
 from migrations import init_db
 from signals import fetch_signals
 from utils import logger, is_market_open
@@ -26,6 +34,31 @@ from config import (
 )
 
 _ET = pytz.timezone("US/Eastern")
+_LAST_KNOWN_HELD_SYMBOLS: set[str] = set()
+
+
+def _ta_symbols() -> list[str]:
+    """Analyze both the watch list and any currently held symbols for stop coverage."""
+    global _LAST_KNOWN_HELD_SYMBOLS
+
+    symbols = {s.upper() for s in SYMBOLS}
+    held_symbols = get_open_position_symbols()
+    if held_symbols is not None:
+        _LAST_KNOWN_HELD_SYMBOLS = set(held_symbols)
+        symbols.update(held_symbols)
+        return sorted(symbols)
+
+    fallback_symbols = set(_LAST_KNOWN_HELD_SYMBOLS)
+    local_held_symbols = get_locally_known_held_symbols()
+    if local_held_symbols:
+        fallback_symbols.update(local_held_symbols)
+    if fallback_symbols:
+        logger.warning(
+            "Open-positions read failed; reusing known held symbols for risk checks: %s",
+            sorted(fallback_symbols),
+        )
+        symbols.update(fallback_symbols)
+    return sorted(symbols)
 
 
 def fmp_job():
@@ -38,6 +71,7 @@ def fmp_job():
     if not is_market_open():
         return
     try:
+        reconcile_pending_orders()
         signals = fetch_signals()
         for symbol in signals.get("buy", []):
             try:
@@ -61,8 +95,9 @@ def ta_job():
     if not is_market_open():
         logger.info("Market closed - skipping")
         return
+    reconcile_pending_orders()
     no_signal = []
-    for symbol in SYMBOLS:
+    for symbol in _ta_symbols():
         try:
             fetch_and_store(symbol)
             analysis = analyze_trends(symbol)

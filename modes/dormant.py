@@ -1,10 +1,11 @@
 # Dormant mode — analysis and alerts run normally; no orders are submitted.
 #
 # Philosophy:
-#   - MAX_DAILY_TRADES=0 means the daily-cap check always blocks execution before
-#     any order reaches Alpaca.  The full TA loop still runs: data is fetched,
-#     indicators are computed, signals are logged, and Discord alerts fire — you
-#     just won't see any BUY or SELL orders.
+#   - trading.py also hard-disables order submission when TRADING_MODE=dormant,
+#     so BUY, SELL, stop-loss, and trailing-stop orders are all suppressed.
+#     The full TA loop still runs: data is fetched, indicators are computed,
+#     signals are logged, and Discord alerts fire — you just won't see any
+#     orders reach Alpaca.
 #   - Use this when you want to observe signal quality, evaluate a new watchlist,
 #     or simply pause trading while remaining connected to the market.
 #   - Switch back to any active mode and restart to resume trading.
@@ -13,7 +14,7 @@
 # leave the bot in dormant mode and flip it back, the risk settings are sane.
 
 PARAMS = {
-    # Trade frequency caps — zero means the daily cap is never satisfied, blocking all orders
+    # Trade frequency caps — zero keeps entry logic from opening new positions
     "MAX_DAILY_TRADES": 0,
     "MAX_WEEKLY_TRADES": 0,
 

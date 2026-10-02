@@ -91,7 +91,7 @@ def fetch_positions():
             })
         return out
     except Exception:
-        return []
+        return None
 
 
 def fetch_recent_trades(limit: int = 20):
@@ -217,7 +217,7 @@ def send_eod_summary() -> None:
 
     trades = fetch_todays_trades()
     open_equity, close_equity = _fetch_todays_snapshots()
-    positions = fetch_positions()
+    positions = fetch_positions() or []
     date_str = datetime.now(_ET).strftime("%B %d, %Y")
 
     lines = []
@@ -285,7 +285,7 @@ def send_eod_summary() -> None:
 def print_report():
     """Print a concise text summary to stdout."""
     account = fetch_account_summary()
-    positions = fetch_positions()
+    positions = fetch_positions() or []
     recent = fetch_recent_trades(20)
     daily, weekly = fetch_daily_weekly_counts()
 

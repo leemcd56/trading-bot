@@ -3,6 +3,9 @@ import os
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
+from numbers import Number
+from urllib.parse import urlparse
+from uuid import UUID
 import pytz
 import duckdb
 from alpaca.trading.client import TradingClient
@@ -34,6 +37,7 @@ from config import (
     REQUIRE_VOLUME_CONFIRMATION,
     LONG_TERM_SMA_PERIOD,
     MIN_HOLD_HOURS,
+    TRADING_MODE,
 )
 
 load_dotenv()
@@ -45,16 +49,18 @@ if _base_url:
     _base_url = _base_url.rstrip("/")
     if _base_url.endswith("/v2"):
         _base_url = _base_url[:-3]
+_PAPER_TRADING_ENABLED = True
 trading_client = TradingClient(
     api_key=os.getenv('ALPACA_API_KEY'),
     secret_key=os.getenv('ALPACA_SECRET_KEY'),
-    paper=True,   # Change to False only when going live (very carefully!)
+    paper=_PAPER_TRADING_ENABLED,   # Change to False only when going live (very carefully!)
     url_override=_base_url if _base_url else None,
 )
 
 TRADE_LOG_TABLE = "trade_log"
 TRAIL_STATE_TABLE = "trail_state"
 TRADE_HISTORY_TABLE = "trade_history"
+PENDING_ORDERS_TABLE = "pending_orders"
 
 
 def _ensure_trade_log(con: duckdb.DuckDBPyConnection) -> None:
@@ -84,6 +90,242 @@ def _ensure_trade_history(con: duckdb.DuckDBPyConnection) -> None:
             source VARCHAR
         )
     """)
+
+
+def _ensure_pending_orders(con: duckdb.DuckDBPyConnection) -> None:
+    con.execute(f"""
+        CREATE TABLE IF NOT EXISTS {PENDING_ORDERS_TABLE} (
+            order_id VARCHAR PRIMARY KEY,
+            symbol VARCHAR,
+            side VARCHAR,
+            source VARCHAR,
+            fallback_price DOUBLE,
+            recorded_qty DOUBLE,
+            submitted_at DOUBLE
+        )
+    """)
+
+
+def _to_float(value) -> float | None:
+    try:
+        if value is None:
+            return None
+        if isinstance(value, Number):
+            return float(value)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            return float(stripped)
+        return None
+    except (TypeError, ValueError):
+        return None
+
+
+def _enum_value(value):
+    return getattr(value, "value", value)
+
+
+def _order_status(order) -> str:
+    status = _enum_value(getattr(order, "status", None))
+    return str(status).lower().strip() if status is not None else ""
+
+
+def _order_id(order) -> str | None:
+    oid = getattr(order, "id", None)
+    if isinstance(oid, UUID):
+        return str(oid)
+    if isinstance(oid, str) and oid.strip():
+        return oid.strip()
+    return None
+
+
+def _order_filled_qty(order) -> float:
+    filled_qty = _to_float(getattr(order, "filled_qty", None))
+    if filled_qty is not None:
+        return max(0.0, filled_qty)
+    if _order_status(order) == "filled":
+        requested_qty = _to_float(getattr(order, "qty", None))
+        if requested_qty is not None:
+            return max(0.0, requested_qty)
+    return 0.0
+
+
+def _order_fill_price(order, fallback_price: float | None) -> float | None:
+    return _to_float(getattr(order, "filled_avg_price", None)) or fallback_price
+
+
+def _alpaca_host_mode(url: str | None) -> str | None:
+    if not url:
+        return "paper" if _PAPER_TRADING_ENABLED else "live"
+    host = urlparse(url).netloc.lower()
+    if "paper-api.alpaca.markets" in host:
+        return "paper"
+    if host == "api.alpaca.markets" or host.endswith(".api.alpaca.markets"):
+        return "live"
+    return None
+
+
+def get_trading_runtime_status() -> dict:
+    """
+    Report whether order submission is currently allowed.
+    This bot must remain in paper mode; a live-host override is a hard stop.
+    """
+    if TRADING_MODE == "dormant":
+        return {
+            "orders_allowed": False,
+            "state": "dormant",
+            "label": "Dormant",
+            "detail": "Dormant mode disables all order submission.",
+        }
+
+    host_mode = _alpaca_host_mode(_base_url)
+    if host_mode and host_mode != ("paper" if _PAPER_TRADING_ENABLED else "live"):
+        return {
+            "orders_allowed": False,
+            "state": "misconfigured",
+            "label": "Misconfigured",
+            "detail": (
+                "Paper trading is enabled, but ALPACA_BASE_URL points at a live Alpaca host."
+                if _PAPER_TRADING_ENABLED
+                else "Live trading is enabled, but ALPACA_BASE_URL points at the paper host."
+            ),
+        }
+
+    return {
+        "orders_allowed": True,
+        "state": "paper",
+        "label": "Paper",
+        "detail": "Paper trading is enabled.",
+    }
+
+
+def _orders_allowed() -> tuple[bool, str]:
+    status = get_trading_runtime_status()
+    return bool(status["orders_allowed"]), str(status["detail"])
+
+
+def _remember_pending_order(
+    order_id: str,
+    symbol: str,
+    side: str,
+    source: str,
+    fallback_price: float | None,
+) -> None:
+    con = duckdb.connect(DB_PATH)
+    try:
+        _ensure_pending_orders(con)
+        con.execute(f"DELETE FROM {PENDING_ORDERS_TABLE} WHERE order_id = ?", [order_id])
+        con.execute(
+            f"""
+            INSERT INTO {PENDING_ORDERS_TABLE}
+                (order_id, symbol, side, source, fallback_price, recorded_qty, submitted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [order_id, symbol, side, source, fallback_price, 0.0, time.time()],
+        )
+    finally:
+        con.close()
+
+
+def _record_order_fill_delta(
+    symbol: str,
+    side: str,
+    source: str,
+    fallback_price: float | None,
+    order,
+    recorded_qty: float,
+) -> float:
+    filled_qty = _order_filled_qty(order)
+    delta = max(0.0, filled_qty - recorded_qty)
+    if delta <= 0:
+        return 0.0
+    _record_trade(symbol, side, delta)
+    _record_trade_history(symbol, side, delta, _order_fill_price(order, fallback_price), source)
+    return delta
+
+
+def reconcile_pending_orders(
+    order_id: str | None = None,
+    attempts: int = 1,
+) -> dict[str, float]:
+    """
+    Reconcile previously submitted orders against Alpaca.
+    Only filled quantities are written into trade_log/trade_history, so unfilled
+    orders never consume PDT or trade-cap slots locally.
+    """
+    if not hasattr(trading_client, "get_order_by_id"):
+        return {}
+
+    attempts = max(1, int(attempts))
+    recorded: dict[str, float] = {}
+    terminal_statuses = {"filled", "canceled", "cancelled", "expired", "rejected"}
+
+    for _ in range(attempts):
+        con = duckdb.connect(DB_PATH)
+        try:
+            _ensure_pending_orders(con)
+            if order_id:
+                rows = con.execute(
+                    f"""
+                    SELECT order_id, symbol, side, source, fallback_price, recorded_qty
+                    FROM {PENDING_ORDERS_TABLE}
+                    WHERE order_id = ?
+                    """,
+                    [order_id],
+                ).fetchall()
+            else:
+                rows = con.execute(
+                    f"""
+                    SELECT order_id, symbol, side, source, fallback_price, recorded_qty
+                    FROM {PENDING_ORDERS_TABLE}
+                    ORDER BY submitted_at
+                    """
+                ).fetchall()
+        finally:
+            con.close()
+
+        if not rows:
+            break
+
+        for row_order_id, symbol, side, source, fallback_price, recorded_qty in rows:
+            try:
+                remote_order = trading_client.get_order_by_id(row_order_id)
+            except Exception as err:
+                logger.warning(f"Could not reconcile order {row_order_id} for {symbol}: {err}")
+                continue
+
+            prior_recorded = float(recorded_qty or 0)
+            new_delta = _record_order_fill_delta(
+                symbol=symbol,
+                side=side,
+                source=source,
+                fallback_price=fallback_price,
+                order=remote_order,
+                recorded_qty=prior_recorded,
+            )
+            if new_delta > 0:
+                recorded[row_order_id] = recorded.get(row_order_id, 0.0) + new_delta
+
+            latest_recorded = prior_recorded + new_delta
+            status = _order_status(remote_order)
+
+            con = duckdb.connect(DB_PATH)
+            try:
+                _ensure_pending_orders(con)
+                if status in terminal_statuses:
+                    con.execute(f"DELETE FROM {PENDING_ORDERS_TABLE} WHERE order_id = ?", [row_order_id])
+                    if side.upper() == "SELL" and latest_recorded > 0 and status == "filled":
+                        _clear_trail_state(symbol)
+                else:
+                    con.execute(
+                        f"UPDATE {PENDING_ORDERS_TABLE} SET recorded_qty = ? WHERE order_id = ?",
+                        [latest_recorded, row_order_id],
+                    )
+            finally:
+                con.close()
+
+    return recorded
 
 
 def _record_trade_history(symbol: str, side: str, qty: float, price: float | None, source: str) -> None:
@@ -133,7 +375,7 @@ def _today_et_start_ts() -> float:
     return midnight_et.timestamp()
 
 
-def _count_daily() -> int:
+def _count_daily() -> int | None:
     con = duckdb.connect(DB_PATH)
     try:
         _ensure_trade_log(con)
@@ -144,12 +386,12 @@ def _count_daily() -> int:
         return out[0] if out else 0
     except Exception as e:
         logger.warning(f"Could not read trade log for daily count: {e}")
-        return 0
+        return None
     finally:
         con.close()
 
 
-def _count_weekly() -> int:
+def _count_weekly() -> int | None:
     con = duckdb.connect(DB_PATH)
     try:
         _ensure_trade_log(con)
@@ -162,7 +404,7 @@ def _count_weekly() -> int:
         return out[0] if out else 0
     except Exception as e:
         logger.warning(f"Could not read trade log for weekly count: {e}")
-        return 0
+        return None
     finally:
         con.close()
 
@@ -289,13 +531,59 @@ def _clear_trail_state(symbol: str) -> None:
         con.close()
 
 
-def _open_positions_count() -> int:
+def _open_positions_count() -> int | None:
     try:
         positions = trading_client.get_all_positions()
         return sum(1 for p in positions if float(p.qty) > 0)
     except Exception as e:
         logger.error(f"Failed to get positions: {e}")
-        return 0
+        return None
+
+
+def get_open_position_symbols() -> set[str] | None:
+    """Return held symbols with positive quantity, or None on API failure."""
+    try:
+        positions = trading_client.get_all_positions()
+        return {
+            str(p.symbol).upper()
+            for p in positions
+            if _to_float(getattr(p, "qty", 0)) and float(p.qty) > 0
+        }
+    except Exception as e:
+        logger.error(f"Failed to get positions: {e}")
+        return None
+
+
+def get_locally_known_held_symbols() -> set[str] | None:
+    """
+    Derive held symbols from the locally recorded filled trade log.
+    Used only as a fallback when the live positions read fails.
+    """
+    con = duckdb.connect(DB_PATH)
+    try:
+        _ensure_trade_log(con)
+        rows = con.execute(
+            f"""
+            SELECT
+                symbol,
+                SUM(
+                    CASE
+                        WHEN UPPER(side) = 'BUY' THEN CASE WHEN qty IS NULL OR qty <= 0 THEN 1 ELSE qty END
+                        WHEN UPPER(side) = 'SELL' THEN -CASE WHEN qty IS NULL OR qty <= 0 THEN 1 ELSE qty END
+                        ELSE 0
+                    END
+                ) AS net_qty
+            FROM {TRADE_LOG_TABLE}
+            GROUP BY symbol
+            HAVING net_qty > 0
+            """
+        ).fetchall()
+        return {str(symbol).upper() for symbol, _net_qty in rows if symbol}
+    except Exception as e:
+        logger.error(f"Failed to derive locally known held symbols: {e}")
+        return None
+    finally:
+        con.close()
 
 
 def _get_account_equity() -> float | None:
@@ -485,11 +773,94 @@ def _buy_gate_scorecard(analysis: dict) -> str:
     return " ".join([f"{name}={'Y' if ok else 'N'}" for name, ok in gates])
 
 
+def _entry_caps_allow_buy(symbol: str, source: str) -> bool:
+    daily_count = _count_daily()
+    if daily_count is None:
+        logger.error(f"{symbol}{source}: Refusing BUY - daily trade count unavailable")
+        return False
+    if daily_count >= MAX_DAILY_TRADES:
+        logger.warning(
+            f"{symbol}{source}: Skipping BUY - daily trade cap reached "
+            f"({daily_count}/{MAX_DAILY_TRADES})"
+        )
+        return False
+
+    weekly_count = _count_weekly()
+    if weekly_count is None:
+        logger.error(f"{symbol}{source}: Refusing BUY - weekly trade count unavailable")
+        return False
+    if weekly_count >= MAX_WEEKLY_TRADES:
+        logger.warning(
+            f"{symbol}{source}: Skipping BUY - weekly trade cap reached "
+            f"({weekly_count}/{MAX_WEEKLY_TRADES})"
+        )
+        return False
+
+    open_positions = _open_positions_count()
+    if open_positions is None:
+        logger.error(f"{symbol}{source}: Refusing BUY - open positions count unavailable")
+        return False
+    if open_positions >= MAX_OPEN_POSITIONS:
+        logger.warning(
+            f"{symbol}{source}: Skipping BUY - max open positions ({MAX_OPEN_POSITIONS})"
+        )
+        return False
+
+    return True
+
+
+def _submit_order(
+    *,
+    symbol: str,
+    order,
+    side: str,
+    source: str,
+    fallback_price: float | None,
+    failure_prefix: str,
+) -> tuple[bool, bool]:
+    """
+    Submit an Alpaca order and reconcile fills into the local logs.
+    Returns (submitted, any_fill_recorded).
+    """
+    orders_allowed, reason = _orders_allowed()
+    if not orders_allowed:
+        logger.warning(f"{symbol} [{source}]: Skipping {side} order - {reason}")
+        return False, False
+
+    try:
+        submitted_order = trading_client.submit_order(order)
+    except Exception as order_err:
+        logger.error(f"{failure_prefix} for {symbol}: {order_err}")
+        send_alert(f"{failure_prefix} for {symbol}: {order_err}", "error")
+        return False, False
+
+    order_id = _order_id(submitted_order)
+    if order_id:
+        _remember_pending_order(order_id, symbol, side, source, fallback_price)
+        recorded = reconcile_pending_orders(order_id=order_id, attempts=2)
+        return True, order_id in recorded
+
+    # Fall back to the returned payload when the SDK object lacks an order id.
+    did_record = _record_order_fill_delta(
+        symbol=symbol,
+        side=side,
+        source=source,
+        fallback_price=fallback_price,
+        order=submitted_order,
+        recorded_qty=0.0,
+    ) > 0
+    if side.upper() == "SELL" and did_record and _order_status(submitted_order) == "filled":
+        _clear_trail_state(symbol)
+    if not did_record:
+        logger.warning(f"{symbol} [{source}]: Order submitted but not yet filled; local trade log unchanged")
+    return True, did_record
+
+
 def _try_risk_exit(symbol: str, analysis: dict) -> bool:
     """
     Stop-loss and trailing-stop. Runs regardless of strong_trend so protection
-    is never gated on ADX. Returns True if an exit order was submitted (or
-    intentionally blocked by PDT after a trigger).
+    is never gated on ADX. Returns True when a risk-exit trigger was handled,
+    even if an order could not be submitted or has not filled yet.
     """
     try:
         position = trading_client.get_open_position(symbol)
@@ -503,39 +874,33 @@ def _try_risk_exit(symbol: str, analysis: dict) -> bool:
 
         # ─── Stop-loss ───
         if current <= entry * (1 - STOP_LOSS_PCT):
-            if _should_block_sell_pdt(symbol):
-                logger.warning(
-                    f"{symbol}: Skipping stop-loss SELL - PDT limit reached "
-                    f"({_count_day_trades_in_last_5_days()}/{MAX_DAY_TRADES_IN_5_DAYS} day trades in 5 days)"
-                )
-                send_alert(
-                    f"{symbol}: Stop-loss skipped (PDT limit). Consider closing tomorrow.",
-                    "error",
-                )
-                return True
             order = MarketOrderRequest(
                 symbol=symbol,
                 qty=qty,
                 side=OrderSide.SELL,
                 time_in_force=TimeInForce.DAY,
             )
-            try:
-                trading_client.submit_order(order)
-            except Exception as order_err:
-                logger.error(f"Stop-loss order submission failed for {symbol}: {order_err}")
-                send_alert(f"Stop-loss order FAILED for {symbol}: {order_err}", "error")
+            submitted, recorded_fill = _submit_order(
+                symbol=symbol,
+                order=order,
+                side="SELL",
+                source="stop-loss",
+                fallback_price=current,
+                failure_prefix="Stop-loss order FAILED",
+            )
+            if not submitted:
                 return True
-            _record_trade(symbol, "SELL", qty)
-            _record_trade_history(symbol, "SELL", qty, current, "stop-loss")
-            _clear_trail_state(symbol)
             logger.warning(
                 f"Stop-loss SELL for {symbol}: price {current:.2f} <= entry {entry:.2f} "
                 f"* (1 - {STOP_LOSS_PCT:.0%})"
             )
-            send_alert(
-                f"Stop-loss SELL {symbol} qty={qty:.4g} @ {current:.2f} (entry {entry:.2f})",
-                "trade",
-            )
+            if recorded_fill:
+                send_alert(
+                    f"Stop-loss SELL {symbol} qty={qty:.4g} @ {current:.2f} (entry {entry:.2f})",
+                    "trade",
+                )
+            else:
+                logger.info(f"{symbol}: Stop-loss order submitted; waiting for fill before logging trade")
             return True
 
         # ─── Trailing stop ───
@@ -547,40 +912,34 @@ def _try_risk_exit(symbol: str, analysis: dict) -> bool:
         _set_trail_running_high(symbol, running_high)
         trail_active = current >= entry * (1 + TRAIL_ACTIVATION_PCT)
         if trail_active and current <= running_high * (1 - TRAIL_PCT):
-            if _should_block_sell_pdt(symbol):
-                logger.warning(
-                    f"{symbol}: Skipping trailing-stop SELL - PDT limit reached "
-                    f"({_count_day_trades_in_last_5_days()}/{MAX_DAY_TRADES_IN_5_DAYS} day trades in 5 days)"
-                )
-                send_alert(
-                    f"{symbol}: Trailing-stop skipped (PDT limit). Consider closing tomorrow.",
-                    "error",
-                )
-                return True
             order = MarketOrderRequest(
                 symbol=symbol,
                 qty=qty,
                 side=OrderSide.SELL,
                 time_in_force=TimeInForce.DAY,
             )
-            try:
-                trading_client.submit_order(order)
-            except Exception as order_err:
-                logger.error(f"Trailing-stop order submission failed for {symbol}: {order_err}")
-                send_alert(f"Trailing-stop order FAILED for {symbol}: {order_err}", "error")
+            submitted, recorded_fill = _submit_order(
+                symbol=symbol,
+                order=order,
+                side="SELL",
+                source="trailing-stop",
+                fallback_price=current,
+                failure_prefix="Trailing-stop order FAILED",
+            )
+            if not submitted:
                 return True
-            _record_trade(symbol, "SELL", qty)
-            _record_trade_history(symbol, "SELL", qty, current, "trailing-stop")
-            _clear_trail_state(symbol)
             logger.warning(
                 f"Trailing-stop SELL for {symbol}: price {current:.2f} <= running_high "
                 f"{running_high:.2f} * (1 - {TRAIL_PCT:.0%})"
             )
-            send_alert(
-                f"Trailing-stop SELL {symbol} qty={qty:.4g} @ {current:.2f} "
-                f"(running_high {running_high:.2f})",
-                "trade",
-            )
+            if recorded_fill:
+                send_alert(
+                    f"Trailing-stop SELL {symbol} qty={qty:.4g} @ {current:.2f} "
+                    f"(running_high {running_high:.2f})",
+                    "trade",
+                )
+            else:
+                logger.info(f"{symbol}: Trailing-stop order submitted; waiting for fill before logging trade")
             return True
     except Exception as e:
         if "position does not exist" not in str(e).lower() and "not found" not in str(e).lower():
@@ -629,25 +988,12 @@ def execute_trade(symbol: str, analysis: dict | None):
 
     if core_ok:
         # Daily/weekly caps apply to new entries only — never block exits.
-        if _count_daily() >= MAX_DAILY_TRADES:
-            logger.warning(
-                f"{symbol}: Skipping BUY - daily trade cap reached "
-                f"({_count_daily()}/{MAX_DAILY_TRADES})"
-            )
-            return
-        if _count_weekly() >= MAX_WEEKLY_TRADES:
-            logger.warning(
-                f"{symbol}: Skipping BUY - weekly trade cap reached "
-                f"({_count_weekly()}/{MAX_WEEKLY_TRADES})"
-            )
+        if not _entry_caps_allow_buy(symbol, ""):
             return
         if _would_sell_be_day_trade(symbol):
             logger.warning(
                 f"{symbol}: Skipping BUY - already purchased today (one entry per symbol per day)"
             )
-            return
-        if _open_positions_count() >= MAX_OPEN_POSITIONS:
-            logger.warning(f"{symbol}: Skipping BUY - max open positions ({MAX_OPEN_POSITIONS})")
             return
         if NOTIONAL_PER_TRADE is not None and NOTIONAL_PER_TRADE >= 1:
             # Fractional mode: buy a fixed dollar amount, or 1 whole share if price <= notional
@@ -660,19 +1006,22 @@ def execute_trade(symbol: str, analysis: dict | None):
                     side=OrderSide.BUY,
                     time_in_force=TimeInForce.DAY,
                 )
-                try:
-                    trading_client.submit_order(order)
-                except Exception as order_err:
-                    logger.error(f"BUY order submission failed for {symbol}: {order_err}")
-                    send_alert(f"BUY order FAILED for {symbol}: {order_err}", "error")
+                submitted, recorded_fill = _submit_order(
+                    symbol=symbol,
+                    order=order,
+                    side="BUY",
+                    source="ta",
+                    fallback_price=price,
+                    failure_prefix="BUY order FAILED",
+                )
+                if not submitted:
                     return
-                _record_trade(symbol, "BUY", 1)
-                _record_trade_history(symbol, "BUY", 1, price, "ta")
                 logger.info(
                     f"BUY submitted for {symbol} qty=1 "
                     f"(whole share, price ${price:.2f} <= ${NOTIONAL_PER_TRADE})"
                 )
-                send_alert(f"BUY {symbol} 1 share @ ~${price:.2f}", "trade")
+                if recorded_fill:
+                    send_alert(f"BUY {symbol} 1 share @ ~${price:.2f}", "trade")
             else:
                 notional = min(float(NOTIONAL_PER_TRADE), buying_power) if buying_power > 0 else 0.0
                 if notional < 1:
@@ -687,16 +1036,19 @@ def execute_trade(symbol: str, analysis: dict | None):
                     side=OrderSide.BUY,
                     time_in_force=TimeInForce.DAY,
                 )
-                try:
-                    trading_client.submit_order(order)
-                except Exception as order_err:
-                    logger.error(f"BUY order submission failed for {symbol}: {order_err}")
-                    send_alert(f"BUY order FAILED for {symbol}: {order_err}", "error")
+                submitted, recorded_fill = _submit_order(
+                    symbol=symbol,
+                    order=order,
+                    side="BUY",
+                    source="ta",
+                    fallback_price=analysis.get("current_price"),
+                    failure_prefix="BUY order FAILED",
+                )
+                if not submitted:
                     return
-                _record_trade(symbol, "BUY", 0)
-                _record_trade_history(symbol, "BUY", 0, analysis.get("current_price"), "ta")
                 logger.info(f"BUY submitted for {symbol} notional=${notional:.2f}")
-                send_alert(f"BUY {symbol} ${notional:.2f}", "trade")
+                if recorded_fill:
+                    send_alert(f"BUY {symbol} ${notional:.2f}", "trade")
         else:
             equity = _get_account_equity()
             if equity is None:
@@ -718,16 +1070,19 @@ def execute_trade(symbol: str, analysis: dict | None):
                 side=OrderSide.BUY,
                 time_in_force=TimeInForce.DAY,
             )
-            try:
-                trading_client.submit_order(order)
-            except Exception as order_err:
-                logger.error(f"BUY order submission failed for {symbol}: {order_err}")
-                send_alert(f"BUY order FAILED for {symbol}: {order_err}", "error")
+            submitted, recorded_fill = _submit_order(
+                symbol=symbol,
+                order=order,
+                side="BUY",
+                source="ta",
+                fallback_price=analysis.get("current_price"),
+                failure_prefix="BUY order FAILED",
+            )
+            if not submitted:
                 return
-            _record_trade(symbol, "BUY", qty)
-            _record_trade_history(symbol, "BUY", qty, analysis.get("current_price"), "ta")
             logger.info(f"BUY submitted for {symbol} qty={qty}")
-            send_alert(f"BUY {symbol} qty={qty}", "trade")
+            if recorded_fill:
+                send_alert(f"BUY {symbol} qty={qty}", "trade")
 
     elif _ta_sell_signal(analysis):
         try:
@@ -759,17 +1114,19 @@ def execute_trade(symbol: str, analysis: dict | None):
                     side=OrderSide.SELL,
                     time_in_force=TimeInForce.DAY,
                 )
-                try:
-                    trading_client.submit_order(order)
-                except Exception as order_err:
-                    logger.error(f"SELL order submission failed for {symbol}: {order_err}")
-                    send_alert(f"SELL order FAILED for {symbol}: {order_err}", "error")
+                submitted, recorded_fill = _submit_order(
+                    symbol=symbol,
+                    order=order,
+                    side="SELL",
+                    source="ta",
+                    fallback_price=analysis.get("current_price"),
+                    failure_prefix="SELL order FAILED",
+                )
+                if not submitted:
                     return
-                _record_trade(symbol, "SELL", qty)
-                _record_trade_history(symbol, "SELL", qty, analysis.get("current_price"), "ta")
-                _clear_trail_state(symbol)
                 logger.info(f"SELL submitted for {symbol}")
-                send_alert(f"SELL {symbol} qty={qty:.4g}", "trade")
+                if recorded_fill:
+                    send_alert(f"SELL {symbol} qty={qty:.4g}", "trade")
     else:
         reasons = _skip_reasons_buy(analysis)
         scorecard = _buy_gate_scorecard(analysis)
@@ -785,14 +1142,7 @@ def execute_signal_buy(symbol: str) -> None:
     Buy symbol based on an external signal. Skips all TA gates but still
     respects daily/weekly trade caps, open-position limit, and notional sizing.
     """
-    if _count_daily() >= MAX_DAILY_TRADES:
-        logger.warning(f"{symbol} [signal]: Skipping BUY - daily cap ({_count_daily()}/{MAX_DAILY_TRADES})")
-        return
-    if _count_weekly() >= MAX_WEEKLY_TRADES:
-        logger.warning(f"{symbol} [signal]: Skipping BUY - weekly cap ({_count_weekly()}/{MAX_WEEKLY_TRADES})")
-        return
-    if _open_positions_count() >= MAX_OPEN_POSITIONS:
-        logger.warning(f"{symbol} [signal]: Skipping BUY - max open positions ({MAX_OPEN_POSITIONS})")
+    if not _entry_caps_allow_buy(symbol, " [signal]"):
         return
 
     # Don't double-buy a symbol we're already holding.
@@ -804,6 +1154,7 @@ def execute_signal_buy(symbol: str) -> None:
     except Exception as e:
         if "position does not exist" not in str(e).lower() and "not found" not in str(e).lower():
             logger.error(f"{symbol} [signal]: Position check failed: {e}")
+            return
 
     buying_power = _get_buying_power()
 
@@ -814,16 +1165,19 @@ def execute_signal_buy(symbol: str) -> None:
             order = MarketOrderRequest(
                 symbol=symbol, qty=1, side=OrderSide.BUY, time_in_force=TimeInForce.DAY
             )
-            try:
-                trading_client.submit_order(order)
-            except Exception as order_err:
-                logger.error(f"{symbol} [signal]: BUY order failed: {order_err}")
-                send_alert(f"[signal] BUY order FAILED for {symbol}: {order_err}", "error")
+            submitted, recorded_fill = _submit_order(
+                symbol=symbol,
+                order=order,
+                side="BUY",
+                source="signal",
+                fallback_price=price,
+                failure_prefix="[signal] BUY order FAILED",
+            )
+            if not submitted:
                 return
-            _record_trade(symbol, "BUY", 1)
-            _record_trade_history(symbol, "BUY", 1, price, "signal")
             logger.info(f"{symbol} [signal]: BUY submitted qty=1 (whole share @ ~${price:.2f})")
-            send_alert(f"[signal] BUY {symbol} 1 share @ ~${price:.2f}", "trade")
+            if recorded_fill:
+                send_alert(f"[signal] BUY {symbol} 1 share @ ~${price:.2f}", "trade")
         else:
             notional = min(float(NOTIONAL_PER_TRADE), buying_power) if buying_power > 0 else 0.0
             if notional < 1:
@@ -833,32 +1187,38 @@ def execute_signal_buy(symbol: str) -> None:
             order = MarketOrderRequest(
                 symbol=symbol, notional=notional, side=OrderSide.BUY, time_in_force=TimeInForce.DAY
             )
-            try:
-                trading_client.submit_order(order)
-            except Exception as order_err:
-                logger.error(f"{symbol} [signal]: BUY order failed: {order_err}")
-                send_alert(f"[signal] BUY order FAILED for {symbol}: {order_err}", "error")
+            submitted, recorded_fill = _submit_order(
+                symbol=symbol,
+                order=order,
+                side="BUY",
+                source="signal",
+                fallback_price=price,
+                failure_prefix="[signal] BUY order FAILED",
+            )
+            if not submitted:
                 return
-            _record_trade(symbol, "BUY", 0)
-            _record_trade_history(symbol, "BUY", 0, price, "signal")
             logger.info(f"{symbol} [signal]: BUY submitted notional=${notional:.2f}")
-            send_alert(f"[signal] BUY {symbol} ${notional:.2f}", "trade")
+            if recorded_fill:
+                send_alert(f"[signal] BUY {symbol} ${notional:.2f}", "trade")
     else:
         # Qty mode (no notional configured): buy 1 share.
         intraday_price = get_intraday_price(symbol)
         order = MarketOrderRequest(
             symbol=symbol, qty=1, side=OrderSide.BUY, time_in_force=TimeInForce.DAY
         )
-        try:
-            trading_client.submit_order(order)
-        except Exception as order_err:
-            logger.error(f"{symbol} [signal]: BUY order failed: {order_err}")
-            send_alert(f"[signal] BUY order FAILED for {symbol}: {order_err}", "error")
+        submitted, recorded_fill = _submit_order(
+            symbol=symbol,
+            order=order,
+            side="BUY",
+            source="signal",
+            fallback_price=intraday_price,
+            failure_prefix="[signal] BUY order FAILED",
+        )
+        if not submitted:
             return
-        _record_trade(symbol, "BUY", 1)
-        _record_trade_history(symbol, "BUY", 1, intraday_price, "signal")
         logger.info(f"{symbol} [signal]: BUY submitted qty=1")
-        send_alert(f"[signal] BUY {symbol} qty=1", "trade")
+        if recorded_fill:
+            send_alert(f"[signal] BUY {symbol} qty=1", "trade")
 
 
 def execute_signal_sell(symbol: str) -> None:
@@ -901,15 +1261,17 @@ def execute_signal_sell(symbol: str) -> None:
     order = MarketOrderRequest(
         symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY
     )
-    try:
-        trading_client.submit_order(order)
-    except Exception as order_err:
-        logger.error(f"{symbol} [signal]: SELL order failed: {order_err}")
-        send_alert(f"[signal] SELL order FAILED for {symbol}: {order_err}", "error")
-        return
     sell_price = get_intraday_price(symbol)
-    _record_trade(symbol, "SELL", qty)
-    _record_trade_history(symbol, "SELL", qty, sell_price, "signal")
-    _clear_trail_state(symbol)
+    submitted, recorded_fill = _submit_order(
+        symbol=symbol,
+        order=order,
+        side="SELL",
+        source="signal",
+        fallback_price=sell_price,
+        failure_prefix="[signal] SELL order FAILED",
+    )
+    if not submitted:
+        return
     logger.info(f"{symbol} [signal]: SELL submitted qty={qty:.4g}")
-    send_alert(f"[signal] SELL {symbol} qty={qty:.4g}", "trade")
+    if recorded_fill:
+        send_alert(f"[signal] SELL {symbol} qty={qty:.4g}", "trade")

@@ -9,3 +9,8 @@ os.environ.setdefault("MOTHERDUCK_TOKEN", "test-motherduck-token")
 
 # Default to moderate so config.py picks a valid mode during collection.
 os.environ.setdefault("TRADING_MODE", "moderate")
+
+# trading.py constructs an Alpaca client at import time; dummy credentials keep
+# module imports stable in tests that patch the client before use.
+os.environ.setdefault("ALPACA_API_KEY", "test-key")
+os.environ.setdefault("ALPACA_SECRET_KEY", "test-secret")
