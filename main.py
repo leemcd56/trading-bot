@@ -8,6 +8,7 @@ from trading import (
     execute_trade,
     execute_signal_buy,
     execute_signal_sell,
+    get_locally_known_held_symbols,
     get_open_position_symbols,
     prune_old_trade_log,
     reconcile_pending_orders,
@@ -33,14 +34,30 @@ from config import (
 )
 
 _ET = pytz.timezone("US/Eastern")
+_LAST_KNOWN_HELD_SYMBOLS: set[str] = set()
 
 
 def _ta_symbols() -> list[str]:
     """Analyze both the watch list and any currently held symbols for stop coverage."""
+    global _LAST_KNOWN_HELD_SYMBOLS
+
     symbols = {s.upper() for s in SYMBOLS}
     held_symbols = get_open_position_symbols()
-    if held_symbols:
+    if held_symbols is not None:
+        _LAST_KNOWN_HELD_SYMBOLS = set(held_symbols)
         symbols.update(held_symbols)
+        return sorted(symbols)
+
+    fallback_symbols = set(_LAST_KNOWN_HELD_SYMBOLS)
+    local_held_symbols = get_locally_known_held_symbols()
+    if local_held_symbols:
+        fallback_symbols.update(local_held_symbols)
+    if fallback_symbols:
+        logger.warning(
+            "Open-positions read failed; reusing known held symbols for risk checks: %s",
+            sorted(fallback_symbols),
+        )
+        symbols.update(fallback_symbols)
     return sorted(symbols)
 
 

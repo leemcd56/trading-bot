@@ -554,6 +554,38 @@ def get_open_position_symbols() -> set[str] | None:
         return None
 
 
+def get_locally_known_held_symbols() -> set[str] | None:
+    """
+    Derive held symbols from the locally recorded filled trade log.
+    Used only as a fallback when the live positions read fails.
+    """
+    con = duckdb.connect(DB_PATH)
+    try:
+        _ensure_trade_log(con)
+        rows = con.execute(
+            f"""
+            SELECT
+                symbol,
+                SUM(
+                    CASE
+                        WHEN UPPER(side) = 'BUY' THEN CASE WHEN qty IS NULL OR qty <= 0 THEN 1 ELSE qty END
+                        WHEN UPPER(side) = 'SELL' THEN -CASE WHEN qty IS NULL OR qty <= 0 THEN 1 ELSE qty END
+                        ELSE 0
+                    END
+                ) AS net_qty
+            FROM {TRADE_LOG_TABLE}
+            GROUP BY symbol
+            HAVING net_qty > 0
+            """
+        ).fetchall()
+        return {str(symbol).upper() for symbol, _net_qty in rows if symbol}
+    except Exception as e:
+        logger.error(f"Failed to derive locally known held symbols: {e}")
+        return None
+    finally:
+        con.close()
+
+
 def _get_account_equity() -> float | None:
     """Return current account equity (portfolio value). Returns None on error."""
     try:

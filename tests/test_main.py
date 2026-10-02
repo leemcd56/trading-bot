@@ -21,3 +21,21 @@ def test_ta_job_covers_held_symbols_outside_watchlist():
     assert fetch_and_store.call_args_list == [call("AAPL"), call("MSFT")]
     assert analyze_trends.call_args_list == [call("AAPL"), call("MSFT")]
     assert execute_trade.call_args_list == [call("AAPL", analysis), call("MSFT", analysis)]
+
+
+def test_ta_symbols_falls_back_to_local_holdings_when_positions_read_fails():
+    """A failed positions read must not collapse known non-watch holdings to an empty set."""
+    with patch.object(main, "SYMBOLS", ["AAPL"]), \
+         patch.object(main, "_LAST_KNOWN_HELD_SYMBOLS", set()), \
+         patch.object(main, "get_open_position_symbols", return_value=None), \
+         patch.object(main, "get_locally_known_held_symbols", return_value={"MSFT"}):
+        assert main._ta_symbols() == ["AAPL", "MSFT"]
+
+
+def test_ta_symbols_reuses_last_known_holdings_when_live_and_local_reads_fail():
+    """The last successful held-symbol snapshot still protects stops through a later read failure."""
+    with patch.object(main, "SYMBOLS", ["AAPL"]), \
+         patch.object(main, "_LAST_KNOWN_HELD_SYMBOLS", {"MSFT"}), \
+         patch.object(main, "get_open_position_symbols", return_value=None), \
+         patch.object(main, "get_locally_known_held_symbols", return_value=None):
+        assert main._ta_symbols() == ["AAPL", "MSFT"]

@@ -754,6 +754,10 @@
     </table></div>`;
   }
 
+  function renderTransactionsUnavailable(message = 'Trades unavailable') {
+    $('txWrap').innerHTML = `<div class="empty">${message}</div>`;
+  }
+
   // ── chart ────────────────────────────────────────────────────────────────
   function renderChart(data) {
     const canvas = $('portfolioChart');
@@ -887,6 +891,7 @@
     if (pos.status  === 'fulfilled' && Array.isArray(pos.value)) renderPositions(pos.value);
     else renderPositionsUnavailable('Positions unavailable');
     if (txn.status  === 'fulfilled' && Array.isArray(txn.value)) renderTransactions(txn.value);
+    else renderTransactionsUnavailable('Trades unavailable');
     if (hist.status === 'fulfilled' && Array.isArray(hist.value)) renderChart(hist.value);
     if (cnts.status === 'fulfilled' && !cnts.value?.error)   renderTradeCounts(cnts.value);
 

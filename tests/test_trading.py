@@ -6,6 +6,8 @@ import tempfile
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
+import duckdb
+
 # Set before importing trading so TradingClient(...) does not raise (we mock it in tests)
 os.environ["ALPACA_API_KEY"] = "test-key"
 os.environ["ALPACA_SECRET_KEY"] = "test-secret"
@@ -661,6 +663,39 @@ def test_unfilled_stop_loss_sell_is_not_logged():
             trading.execute_trade("TEST", {"strong_trend": True, "current_price": 94.0})
             record_trade.assert_not_called()
             record_history.assert_not_called()
+    finally:
+        if os.path.exists(db_file.name):
+            os.unlink(db_file.name)
+
+
+def test_locally_known_held_symbols_uses_net_filled_trade_log():
+    """Local hold fallback should include only symbols with a positive net filled quantity."""
+    db_file = tempfile.NamedTemporaryFile(suffix=".duckdb", delete=False)
+    db_file.close()
+    os.unlink(db_file.name)
+    con = duckdb.connect(db_file.name)
+    try:
+        con.execute(
+            f"""
+            CREATE TABLE {trading.TRADE_LOG_TABLE} (
+                timestamp_utc DOUBLE,
+                symbol VARCHAR,
+                side VARCHAR,
+                qty DOUBLE
+            )
+            """
+        )
+        con.execute(
+            f"INSERT INTO {trading.TRADE_LOG_TABLE} VALUES "
+            "(1, 'AAPL', 'BUY', 1), "
+            "(2, 'AAPL', 'SELL', 1), "
+            "(3, 'MSFT', 'BUY', 2), "
+            "(4, 'TSLA', 'BUY', 0)"
+        )
+        con.close()
+
+        with patch.object(trading, "DB_PATH", db_file.name):
+            assert trading.get_locally_known_held_symbols() == {"MSFT", "TSLA"}
     finally:
         if os.path.exists(db_file.name):
             os.unlink(db_file.name)
