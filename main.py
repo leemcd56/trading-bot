@@ -16,7 +16,7 @@ from trading import (
 from migrations import init_db
 from signals import fetch_signals
 from utils import logger, is_market_open
-from alerts import send_alert
+from alerts import send_alert, send_heartbeat, HEARTBEAT_URL
 from report import snapshot_portfolio, send_eod_summary
 from config import (
     SYMBOLS,
@@ -95,31 +95,43 @@ def fmp_job():
 
 
 def ta_job():
-    """TA-based trading loop over WATCH_SYMBOLS."""
-    if not is_market_open():
-        logger.info("Market closed - skipping")
-        return
-    reconcile_pending_orders()
-    no_signal = []
-    for symbol in _ta_symbols():
-        try:
-            fetch_and_store(symbol)
-            analysis = analyze_trends(symbol)
-            result = execute_trade(symbol, analysis)
-            if result:
-                no_signal.append(result)
-        except Exception as e:
-            logger.error(f"Error processing {symbol}: {e}")
-            send_alert(f"Error processing {symbol}: {e}", "error")
-    if no_signal:
-        lines = "\n".join(f"• {s}" for s in no_signal)
-        send_alert(f"No signal this cycle:\n{lines}", "hodl")
+    """
+    TA-based trading loop over WATCH_SYMBOLS.
+
+    Pings the dead-man's-switch heartbeat (see alerts.send_heartbeat) in a
+    finally block wrapping the whole cycle, so it fires on every scheduled
+    invocation - including the "market closed, nothing to do" early return -
+    but NOT if the cycle hangs rather than completing or raising. That makes
+    it a liveness signal for the process/scheduler, independent of whether
+    this particular cycle found anything to trade.
+    """
     try:
-        prune_old_trends()
-        prune_old_trade_log()
-    except Exception as e:
-        logger.warning(f"Prune failed: {e}")
-        send_alert(f"Prune failed: {e}", "error")
+        if not is_market_open():
+            logger.info("Market closed - skipping")
+            return
+        reconcile_pending_orders()
+        no_signal = []
+        for symbol in _ta_symbols():
+            try:
+                fetch_and_store(symbol)
+                analysis = analyze_trends(symbol)
+                result = execute_trade(symbol, analysis)
+                if result:
+                    no_signal.append(result)
+            except Exception as e:
+                logger.error(f"Error processing {symbol}: {e}")
+                send_alert(f"Error processing {symbol}: {e}", "error")
+        if no_signal:
+            lines = "\n".join(f"• {s}" for s in no_signal)
+            send_alert(f"No signal this cycle:\n{lines}", "hodl")
+        try:
+            prune_old_trends()
+            prune_old_trade_log()
+        except Exception as e:
+            logger.warning(f"Prune failed: {e}")
+            send_alert(f"Prune failed: {e}", "error")
+    finally:
+        send_heartbeat()
 
 def open_snapshot_job():
     """Capture market-open portfolio equity once per trading day."""
@@ -176,8 +188,15 @@ if __name__ == "__main__":
         f"max_corr={MAX_POSITION_CORRELATION:.2f} max_slippage={MAX_SLIPPAGE_PCT:.2%} | "
         f"stop={STOP_LOSS_PCT:.0%} trail_activate={TRAIL_ACTIVATION_PCT:.0%} trail={TRAIL_PCT:.0%} | "
         f"notional=${NOTIONAL_PER_TRADE} adx_threshold={ADX_STRONG_TREND_THRESHOLD} | "
-        f"mean_reversion={'ON' if MEAN_REVERSION_ENABLED else 'off'}"
+        f"mean_reversion={'ON' if MEAN_REVERSION_ENABLED else 'off'} "
+        f"heartbeat={'configured' if HEARTBEAT_URL else 'off'}"
     )
+    if not HEARTBEAT_URL:
+        logger.warning(
+            "HEARTBEAT_URL is not set - no dead-man's-switch is monitoring this process. "
+            "If it crashes or hangs, nothing will tell you. Set HEARTBEAT_URL in .env to a "
+            "ping URL from a service like healthchecks.io (see AGENTS.md)."
+        )
     # Run both jobs immediately so we see activity right away (e.g. in Railway logs).
     fmp_job()
     ta_job()

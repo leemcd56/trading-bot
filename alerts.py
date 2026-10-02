@@ -16,6 +16,12 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 # Optional email (e.g. for errors only): ALERT_EMAIL_SMTP_URL, ALERT_EMAIL_FROM, ALERT_EMAIL_TO
 # ALERT_EMAIL_SMTP_URL format: smtps://user:pass@smtp.example.com:465 or smtp://...
 
+# Optional dead-man's-switch heartbeat: a ping URL from an external uptime
+# service (e.g. https://hc-ping.com/<uuid> from healthchecks.io, or a
+# Cronitor/UptimeRobot heartbeat URL). See send_heartbeat() below for why
+# this has to be an external service rather than another bot-side alert.
+HEARTBEAT_URL = os.getenv("HEARTBEAT_URL", "")
+
 # Overly dramatic Discord one-liners (embarrassingly meme-worthy)
 BUY_LINES = [
     "🚀 TO THE MOON!!! 🚀",
@@ -70,6 +76,26 @@ def send_alert(message: str, level: str = "info") -> None:
     try:
         if level == "error" and os.getenv("ALERT_EMAIL_TO"):
             _send_email(message, level)
+    except Exception:
+        pass
+
+
+def send_heartbeat() -> None:
+    """
+    Dead-man's-switch ping: fire-and-forget GET to an external uptime/cron-
+    monitoring service (HEARTBEAT_URL). This is deliberately NOT another
+    Discord/email alert from the bot itself - if the process has crashed or
+    hung, it cannot send its own "I'm dead" message. The point of this ping
+    is for a THIRD PARTY to notice its absence and alert you; configure the
+    service's own alerting (e.g. healthchecks.io's "ping stopped" email/SMS)
+    separately. No-op if HEARTBEAT_URL isn't set. Never raises - a failed
+    heartbeat ping must never break the trading loop that called it.
+    """
+    if not HEARTBEAT_URL:
+        return
+    try:
+        import requests
+        requests.get(HEARTBEAT_URL, timeout=5)
     except Exception:
         pass
 

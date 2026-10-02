@@ -34,3 +34,8 @@ os.environ.setdefault("DISCORD_WEBHOOK_URL", "")
 os.environ.setdefault("ALERT_EMAIL_TO", "")
 os.environ.setdefault("ALERT_EMAIL_SMTP_URL", "")
 os.environ.setdefault("ALERT_EMAIL_FROM", "")
+
+# Same reasoning for the heartbeat dead-man's-switch ping (alerts.send_heartbeat):
+# without this, any test that runs main.ta_job() to completion would ping a real
+# external uptime-monitoring URL from the developer's own .env.
+os.environ.setdefault("HEARTBEAT_URL", "")

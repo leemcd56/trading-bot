@@ -1,5 +1,7 @@
 from unittest.mock import call, patch
 
+import pytest
+
 import main
 
 
@@ -39,3 +41,40 @@ def test_ta_symbols_reuses_last_known_holdings_when_live_and_local_reads_fail():
          patch.object(main, "get_open_position_symbols", return_value=None), \
          patch.object(main, "get_locally_known_held_symbols", return_value=None):
         assert main._ta_symbols() == ["AAPL", "MSFT"]
+
+
+def test_ta_job_sends_heartbeat_on_full_cycle():
+    """A completed cycle must ping the dead-man's-switch exactly once."""
+    with patch.object(main, "is_market_open", return_value=True), \
+         patch.object(main, "reconcile_pending_orders"), \
+         patch.object(main, "_ta_symbols", return_value=[]), \
+         patch.object(main, "prune_old_trends"), \
+         patch.object(main, "prune_old_trade_log"), \
+         patch.object(main, "send_heartbeat") as send_heartbeat:
+        main.ta_job()
+    send_heartbeat.assert_called_once()
+
+
+def test_ta_job_sends_heartbeat_when_market_closed():
+    """
+    The heartbeat must still fire on the early-return path - it proves the
+    process/scheduler is alive, independent of whether the market is open.
+    """
+    with patch.object(main, "is_market_open", return_value=False), \
+         patch.object(main, "send_heartbeat") as send_heartbeat:
+        main.ta_job()
+    send_heartbeat.assert_called_once()
+
+
+def test_ta_job_sends_heartbeat_even_if_reconcile_raises():
+    """
+    A finally-block heartbeat must still fire if something above it raises -
+    the process is still alive and ticking, even though this cycle errored.
+    Only a true hang (never reaching the finally) should suppress the ping.
+    """
+    with patch.object(main, "is_market_open", return_value=True), \
+         patch.object(main, "reconcile_pending_orders", side_effect=RuntimeError("boom")), \
+         patch.object(main, "send_heartbeat") as send_heartbeat:
+        with pytest.raises(RuntimeError):
+            main.ta_job()
+    send_heartbeat.assert_called_once()
