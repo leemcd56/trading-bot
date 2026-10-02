@@ -15,6 +15,8 @@ from dotenv import load_dotenv
 from utils import logger
 from alerts import send_alert
 from data_providers import get_intraday_price
+import ai_review
+from ai_review import confirm_trade
 from config import (
     SYMBOLS,
     MAX_DAILY_TRADES,
@@ -947,6 +949,34 @@ def _try_risk_exit(symbol: str, analysis: dict) -> bool:
     return False
 
 
+def _confirm_or_alert_veto(symbol: str, action: str, analysis: dict) -> dict | None:
+    """
+    Ask the AI gate to confirm a BUY/SELL the rules engine already decided on.
+    Returns the verdict dict on CONFIRM, or None (after logging + alerting)
+    on VETO so callers can `if verdict is None: return`. Callers should only
+    reach this once every other skip condition has already been checked, so
+    the AI is never consulted on a trade that's about to be skipped anyway.
+    """
+    verdict = confirm_trade(symbol, action, analysis, TRADING_MODE)
+    if verdict["decision"] != "CONFIRM":
+        logger.info(f"{symbol}: {action} vetoed by AI review - {verdict['reasoning']}")
+        send_alert(f"{symbol}: {action} vetoed by AI review - {verdict['reasoning']}", "hodl")
+        return None
+    return verdict
+
+
+def _ai_alert_suffix(verdict: dict) -> str:
+    """Append the AI gate's reasoning to a trade alert, but only when the gate
+    is actually enabled - otherwise every alert would carry a meaningless
+    'AI confirmation disabled' note. Reads ai_review.AI_CONFIRMATION_ENABLED
+    live (rather than a value imported at module load) so this can never
+    disagree with what confirm_trade() itself just checked."""
+    if not ai_review.AI_CONFIRMATION_ENABLED:
+        return ""
+    reasoning = verdict.get("reasoning")
+    return f" | AI: {reasoning}" if reasoning else ""
+
+
 def execute_trade(symbol: str, analysis: dict | None):
     if not analysis:
         logger.info(f"{symbol}: Skipping - no analysis")
@@ -995,11 +1025,18 @@ def execute_trade(symbol: str, analysis: dict | None):
                 f"{symbol}: Skipping BUY - already purchased today (one entry per symbol per day)"
             )
             return
+
         if NOTIONAL_PER_TRADE is not None and NOTIONAL_PER_TRADE >= 1:
             # Fractional mode: buy a fixed dollar amount, or 1 whole share if price <= notional
             buying_power = _get_buying_power()
             price = analysis.get("current_price") or 0
             if price > 0 and price <= NOTIONAL_PER_TRADE and buying_power >= price:
+                # Rules engine has already formed its own BUY assumption and this
+                # specific order is affordable - only now ask the AI gate to
+                # confirm it before any order is placed.
+                verdict = _confirm_or_alert_veto(symbol, "BUY", analysis)
+                if verdict is None:
+                    return
                 order = MarketOrderRequest(
                     symbol=symbol,
                     qty=1,
@@ -1021,7 +1058,7 @@ def execute_trade(symbol: str, analysis: dict | None):
                     f"(whole share, price ${price:.2f} <= ${NOTIONAL_PER_TRADE})"
                 )
                 if recorded_fill:
-                    send_alert(f"BUY {symbol} 1 share @ ~${price:.2f}", "trade")
+                    send_alert(f"BUY {symbol} 1 share @ ~${price:.2f}{_ai_alert_suffix(verdict)}", "trade")
             else:
                 notional = min(float(NOTIONAL_PER_TRADE), buying_power) if buying_power > 0 else 0.0
                 if notional < 1:
@@ -1030,6 +1067,9 @@ def execute_trade(symbol: str, analysis: dict | None):
                     )
                     return
                 notional = round(notional, 2)
+                verdict = _confirm_or_alert_veto(symbol, "BUY", analysis)
+                if verdict is None:
+                    return
                 order = MarketOrderRequest(
                     symbol=symbol,
                     notional=notional,
@@ -1048,7 +1088,7 @@ def execute_trade(symbol: str, analysis: dict | None):
                     return
                 logger.info(f"BUY submitted for {symbol} notional=${notional:.2f}")
                 if recorded_fill:
-                    send_alert(f"BUY {symbol} ${notional:.2f}", "trade")
+                    send_alert(f"BUY {symbol} ${notional:.2f}{_ai_alert_suffix(verdict)}", "trade")
         else:
             equity = _get_account_equity()
             if equity is None:
@@ -1063,6 +1103,9 @@ def execute_trade(symbol: str, analysis: dict | None):
                     f"{symbol}: Skipping BUY - insufficient buying power "
                     f"(${buying_power:.2f} < ${order_value:.2f})"
                 )
+                return
+            verdict = _confirm_or_alert_veto(symbol, "BUY", analysis)
+            if verdict is None:
                 return
             order = MarketOrderRequest(
                 symbol=symbol,
@@ -1082,7 +1125,7 @@ def execute_trade(symbol: str, analysis: dict | None):
                 return
             logger.info(f"BUY submitted for {symbol} qty={qty}")
             if recorded_fill:
-                send_alert(f"BUY {symbol} qty={qty}", "trade")
+                send_alert(f"BUY {symbol} qty={qty}{_ai_alert_suffix(verdict)}", "trade")
 
     elif _ta_sell_signal(analysis):
         try:
@@ -1108,6 +1151,15 @@ def execute_trade(symbol: str, analysis: dict | None):
                     "error",
                 )
             else:
+                # Rules engine has already formed its own SELL assumption above -
+                # only now ask the AI gate to confirm that specific call before
+                # any order is placed. (Stop-loss/trailing-stop exits above this
+                # function never go through this gate - they must never be delayed
+                # or blocked by an external call.)
+                verdict = _confirm_or_alert_veto(symbol, "SELL", analysis)
+                if verdict is None:
+                    return
+
                 order = MarketOrderRequest(
                     symbol=symbol,
                     qty=qty,
@@ -1126,7 +1178,7 @@ def execute_trade(symbol: str, analysis: dict | None):
                     return
                 logger.info(f"SELL submitted for {symbol}")
                 if recorded_fill:
-                    send_alert(f"SELL {symbol} qty={qty:.4g}", "trade")
+                    send_alert(f"SELL {symbol} qty={qty:.4g}{_ai_alert_suffix(verdict)}", "trade")
     else:
         reasons = _skip_reasons_buy(analysis)
         scorecard = _buy_gate_scorecard(analysis)

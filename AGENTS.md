@@ -76,18 +76,29 @@ Conservative/swing use the strictest combination of the above. Moderate is balan
 - Risk exits always: stop-loss / trailing stop (run even without strong ADX)
 - Mode `MIN_HOLD_HOURS` blocks discretionary TA sells only (not stops): aggressive 0h, moderate/conservative 24h, swing 48h
 
+**AI second-opinion gate** (optional, disabled by default)
+
+- The rules engine above still forms its own BUY/SELL assumption first — nothing about the TA gates changes.
+- Only once a TA-driven BUY or SELL has passed every gate (and the daily/weekly/open-position caps, for BUYs) does `ai_review.confirm_trade()` hand that specific proposed trade, plus the indicator snapshot, to an LLM (Anthropic Messages API) to CONFIRM or VETO. The AI cannot originate a trade, pick a different symbol/side, or turn a HOLD into a trade.
+- Stop-loss and trailing-stop exits (`_try_risk_exit`) and the FMP signal path (`execute_signal_buy`/`execute_signal_sell`) intentionally bypass this gate — safety exits and the external oracle path must never be delayed or blocked by an extra network call.
+- Enable with `AI_CONFIRMATION_ENABLED=true` and `ANTHROPIC_API_KEY` in `.env`; optional `AI_CONFIRMATION_MODEL` (default `claude-sonnet-5`). Fails closed (VETO) on any error, timeout, or missing key.
+
 ## Important Files – Where the Logic Lives
 
 - **`analysis.py`**  
   → Contains the massive `analyze_trends(symbol)` function (reads from DuckDB / MotherDuck)  
   → Also `analyze_trends_from_providers(symbol)`, which fetches candles directly from providers (yfinance/Finnhub) and runs the same indicator stack **without touching the DB**  
   → All TA-Lib calls, DataFrame manipulations, boolean flags  
-  → Returns rich dict with every signal/metric
+  → Returns rich dict with every signal/metric (including raw `adx`, `rsi_14`, `macd`, etc. for the AI review gate)
 
 - **`trading.py`**  
   → `execute_trade(symbol, analysis)`  
   → Alpaca TradingClient initialization  
-  → Buy/sell order submission logic (Market orders, qty=1 for now)
+  → Buy/sell order submission logic (Market orders, qty=1 for now)  
+  → Calls `ai_review.confirm_trade()` before placing a TA-driven BUY/SELL order (see AI second-opinion gate above)
+
+- **`ai_review.py`**  
+  → `confirm_trade(symbol, action, analysis, mode)` — the optional LLM confirm/veto gate described above
 
 - **`data_fetch.py`**  
   → `fetch_and_store(symbol)`  

@@ -14,3 +14,11 @@ os.environ.setdefault("TRADING_MODE", "moderate")
 # module imports stable in tests that patch the client before use.
 os.environ.setdefault("ALPACA_API_KEY", "test-key")
 os.environ.setdefault("ALPACA_SECRET_KEY", "test-secret")
+
+# ai_review.py loads .env itself and reads AI_CONFIRMATION_ENABLED at import
+# time. Force it off for the suite regardless of the developer's real .env,
+# so execute_trade tests never make a real network call to Anthropic; tests
+# that need to exercise the gate mock confirm_trade directly (see
+# tests/test_ai_review.py). setdefault() means this only applies when the
+# variable isn't already set in the environment running pytest.
+os.environ.setdefault("AI_CONFIRMATION_ENABLED", "false")
