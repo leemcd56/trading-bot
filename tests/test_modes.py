@@ -29,6 +29,8 @@ REQUIRED_KEYS = [
     "MAX_PORTFOLIO_RISK_PCT",
     "MAX_POSITION_CORRELATION",
     "MAX_SLIPPAGE_PCT",
+    "CIRCUIT_BREAKER_ENABLED",
+    "CIRCUIT_BREAKER_DRAWDOWN_PCT",
     "MEAN_REVERSION_ENABLED",
     "MEAN_REVERSION_ADX_CEILING",
     "MEAN_REVERSION_RSI_OVERSOLD",
@@ -331,6 +333,17 @@ def test_mean_reversion_ships_disabled_by_default(mode_name):
 
 
 @pytest.mark.parametrize("mode_name", ALL_MODES)
+def test_circuit_breaker_ships_enabled_by_default(mode_name):
+    """
+    Safety net, opposite direction from mean-reversion: the circuit breaker
+    must ship ON in every built-in mode. Unlike a new strategy, it only ever
+    makes the bot more conservative (blocks new entries during a bad day),
+    never introduces new risk - so there's no reason for it to default off.
+    """
+    assert _load_mode(mode_name)["CIRCUIT_BREAKER_ENABLED"] is True
+
+
+@pytest.mark.parametrize("mode_name", ALL_MODES)
 def test_mean_reversion_adx_ceiling_below_trend_threshold(mode_name):
     """The choppy-regime ADX ceiling must leave a dead zone below the trend threshold."""
     params = _load_mode(mode_name)
@@ -364,6 +377,8 @@ def test_config_params_match_mode_file(mode_name):
     assert cfg.MAX_PORTFOLIO_RISK_PCT == expected["MAX_PORTFOLIO_RISK_PCT"]
     assert cfg.MAX_POSITION_CORRELATION == expected["MAX_POSITION_CORRELATION"]
     assert cfg.MAX_SLIPPAGE_PCT == expected["MAX_SLIPPAGE_PCT"]
+    assert cfg.CIRCUIT_BREAKER_ENABLED == expected["CIRCUIT_BREAKER_ENABLED"]
+    assert cfg.CIRCUIT_BREAKER_DRAWDOWN_PCT == expected["CIRCUIT_BREAKER_DRAWDOWN_PCT"]
     assert cfg.MEAN_REVERSION_ENABLED == expected["MEAN_REVERSION_ENABLED"]
     assert cfg.MEAN_REVERSION_ADX_CEILING == expected["MEAN_REVERSION_ADX_CEILING"]
     assert cfg.STOP_LOSS_PCT == expected["STOP_LOSS_PCT"]

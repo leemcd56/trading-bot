@@ -27,6 +27,8 @@ from config import (
     CORRELATION_LOOKBACK_DAYS,
     CORRELATION_MIN_SAMPLES,
     MAX_SLIPPAGE_PCT,
+    CIRCUIT_BREAKER_ENABLED,
+    CIRCUIT_BREAKER_DRAWDOWN_PCT,
     STOP_LOSS_PCT,
     TRADE_LOG_RETAIN_DAYS,
     DB_PATH,
@@ -79,6 +81,13 @@ TRADE_LOG_TABLE = "trade_log"
 TRAIL_STATE_TABLE = "trail_state"
 TRADE_HISTORY_TABLE = "trade_history"
 PENDING_ORDERS_TABLE = "pending_orders"
+# Same table report.snapshot_portfolio() writes "open"/"close" equity into.
+# Duplicated here (schema + table name) rather than imported, since report.py
+# already imports from trading.py - importing back would be circular. This
+# mirrors the existing _ensure_trade_log/_ensure_trade_history duplication
+# between the two modules.
+PORTFOLIO_SNAPSHOTS_TABLE = "portfolio_snapshots"
+CIRCUIT_BREAKER_TRIPS_TABLE = "circuit_breaker_trips"
 
 
 def _ensure_trade_log(con: duckdb.DuckDBPyConnection) -> None:
@@ -106,6 +115,26 @@ def _ensure_trade_history(con: duckdb.DuckDBPyConnection) -> None:
             qty DOUBLE,
             price DOUBLE,
             source VARCHAR
+        )
+    """)
+
+
+def _ensure_portfolio_snapshots(con: duckdb.DuckDBPyConnection) -> None:
+    con.execute(f"""
+        CREATE TABLE IF NOT EXISTS {PORTFOLIO_SNAPSHOTS_TABLE} (
+            timestamp_utc DOUBLE,
+            date_et VARCHAR,
+            label VARCHAR,
+            equity DOUBLE
+        )
+    """)
+
+
+def _ensure_circuit_breaker_trips(con: duckdb.DuckDBPyConnection) -> None:
+    con.execute(f"""
+        CREATE TABLE IF NOT EXISTS {CIRCUIT_BREAKER_TRIPS_TABLE} (
+            date_et VARCHAR PRIMARY KEY,
+            tripped_at DOUBLE
         )
     """)
 
@@ -1049,6 +1078,84 @@ def _buy_gate_scorecard(analysis: dict) -> str:
     return " ".join([f"{name}={'Y' if ok else 'N'}" for name, ok in gates])
 
 
+def _todays_open_equity() -> float | None:
+    """
+    Today's market-open equity snapshot (written by report.snapshot_portfolio
+    as the "open" label), or None if it hasn't been captured yet - e.g. the
+    first few minutes after the bot starts, before open_snapshot_job has run.
+    """
+    con = None
+    try:
+        con = duckdb.connect(DB_PATH)
+        _ensure_portfolio_snapshots(con)
+        date_et = datetime.now(_ET).strftime("%Y-%m-%d")
+        row = con.execute(
+            f"SELECT equity FROM {PORTFOLIO_SNAPSHOTS_TABLE} WHERE date_et = ? AND label = 'open'",
+            [date_et],
+        ).fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+    except Exception as e:
+        logger.warning(f"Could not read today's open-equity snapshot: {e}")
+        return None
+    finally:
+        if con is not None:
+            con.close()
+
+
+def _circuit_breaker_tripped(equity: float, open_equity: float | None) -> bool:
+    """
+    True when today's equity has fallen CIRCUIT_BREAKER_DRAWDOWN_PCT or more
+    from this morning's open snapshot - a portfolio-wide "something is
+    systemically wrong" signal, distinct from any single position's
+    stop-loss (a data-feed bug causing repeated bad trades, or a real crash
+    gapping through several stops at once).
+
+    Blocks NEW entries only. Existing stop-losses/trailing-stops keep running
+    normally in _try_risk_exit - panic-selling into a crash is usually the
+    wrong move, so this never force-closes anything.
+
+    Fails OPEN (not tripped) when there's no open-equity baseline yet. That's
+    a data gap (too early in the day), not evidence something is wrong, and
+    blocking all trading until the next snapshot would be the wrong default.
+    """
+    if not CIRCUIT_BREAKER_ENABLED:
+        return False
+    if open_equity is None or open_equity <= 0:
+        return False
+    drawdown_pct = (open_equity - equity) / open_equity
+    return drawdown_pct >= CIRCUIT_BREAKER_DRAWDOWN_PCT
+
+
+def _claim_circuit_breaker_alert_for_today() -> bool:
+    """
+    True the first time this is called on a given ET date, False on every
+    later call that same day - lets the caller alert exactly once per trip
+    instead of once per cycle for as long as the breaker stays tripped.
+    On a DB error, returns False (don't alert again) since the trade is
+    blocked either way regardless of this function's result.
+    """
+    con = None
+    try:
+        con = duckdb.connect(DB_PATH)
+        _ensure_circuit_breaker_trips(con)
+        date_et = datetime.now(_ET).strftime("%Y-%m-%d")
+        if con.execute(
+            f"SELECT 1 FROM {CIRCUIT_BREAKER_TRIPS_TABLE} WHERE date_et = ?", [date_et]
+        ).fetchone():
+            return False
+        con.execute(
+            f"INSERT INTO {CIRCUIT_BREAKER_TRIPS_TABLE} (date_et, tripped_at) VALUES (?, ?)",
+            [date_et, time.time()],
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"Could not record circuit breaker trip state: {e}")
+        return False
+    finally:
+        if con is not None:
+            con.close()
+
+
 def _entry_caps_allow_buy(symbol: str, source: str) -> bool:
     daily_count = _count_daily()
     if daily_count is None:
@@ -1094,6 +1201,23 @@ def _entry_caps_allow_buy(symbol: str, source: str) -> bool:
     if equity is None:
         logger.error(f"{symbol}{source}: Refusing BUY - account equity unavailable for portfolio risk check")
         return False
+
+    open_equity = _todays_open_equity()
+    if _circuit_breaker_tripped(equity, open_equity):
+        drawdown_pct = (open_equity - equity) / open_equity
+        if _claim_circuit_breaker_alert_for_today():
+            send_alert(
+                f"🔴 Circuit breaker tripped: equity down {drawdown_pct:.1%} from today's open "
+                f"(${open_equity:,.2f} -> ${equity:,.2f}). New entries blocked for the rest of "
+                f"today; existing stop-losses/trailing-stops remain active.",
+                "error",
+            )
+        logger.warning(
+            f"{symbol}{source}: Skipping BUY - circuit breaker tripped "
+            f"({drawdown_pct:.1%} drawdown >= {CIRCUIT_BREAKER_DRAWDOWN_PCT:.1%} threshold)"
+        )
+        return False
+
     open_risk_pct = _portfolio_open_risk_pct(equity, positions)
     if open_risk_pct is None:
         logger.error(f"{symbol}{source}: Refusing BUY - portfolio open risk unavailable")

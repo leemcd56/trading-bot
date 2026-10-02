@@ -112,6 +112,14 @@ _SAFE_FALLBACKS = {
     # qty-based order (entries + discretionary exits). Implemented as a
     # marketable limit order, not a wider market fill.
     "MAX_SLIPPAGE_PCT": 0.003,
+    # Account-wide circuit breaker: blocks NEW entries (not existing stops)
+    # once today's equity has dropped this much from the market-open
+    # snapshot - a portfolio-wide "something is systemically wrong" signal,
+    # distinct from any single position's stop-loss. Enabled by default:
+    # unlike a new strategy, a circuit breaker only ever makes the bot more
+    # conservative, never introduces new risk.
+    "CIRCUIT_BREAKER_ENABLED": True,
+    "CIRCUIT_BREAKER_DRAWDOWN_PCT": 0.05,
 
     # Stop-loss / trailing stop — give positions breathing room
     "STOP_LOSS_PCT": 0.07,
@@ -190,6 +198,8 @@ MAX_OPEN_POSITIONS = _mode_get("MAX_OPEN_POSITIONS")
 MAX_PORTFOLIO_RISK_PCT = _mode_get("MAX_PORTFOLIO_RISK_PCT")
 MAX_POSITION_CORRELATION = _mode_get("MAX_POSITION_CORRELATION")
 MAX_SLIPPAGE_PCT = _mode_get("MAX_SLIPPAGE_PCT")
+CIRCUIT_BREAKER_ENABLED = _mode_get("CIRCUIT_BREAKER_ENABLED")
+CIRCUIT_BREAKER_DRAWDOWN_PCT = _mode_get("CIRCUIT_BREAKER_DRAWDOWN_PCT")
 
 # Stop-loss / trailing stop
 STOP_LOSS_PCT = _mode_get("STOP_LOSS_PCT")
@@ -277,6 +287,19 @@ def _validate_mode_params() -> None:
         problems.append("MAX_SLIPPAGE_PCT <= 0 — qty-based orders could never fill (limit price == reference price)")
     if MAX_SLIPPAGE_PCT is not None and MAX_SLIPPAGE_PCT > 0.05:
         problems.append(f"MAX_SLIPPAGE_PCT={MAX_SLIPPAGE_PCT} (>5%) barely protects against a bad fill")
+
+    # Circuit breaker sanity
+    if not isinstance(CIRCUIT_BREAKER_ENABLED, bool):
+        problems.append("CIRCUIT_BREAKER_ENABLED must be a boolean")
+    if CIRCUIT_BREAKER_DRAWDOWN_PCT is not None and CIRCUIT_BREAKER_DRAWDOWN_PCT <= 0:
+        problems.append(
+            "CIRCUIT_BREAKER_DRAWDOWN_PCT <= 0 — the circuit breaker would trip on any equity "
+            "movement, blocking all trading"
+        )
+    if CIRCUIT_BREAKER_DRAWDOWN_PCT is not None and CIRCUIT_BREAKER_DRAWDOWN_PCT > 0.5:
+        problems.append(
+            f"CIRCUIT_BREAKER_DRAWDOWN_PCT={CIRCUIT_BREAKER_DRAWDOWN_PCT} (>50%) would almost never trip"
+        )
 
     # Mean-reversion counter-strategy sanity (only matters when enabled, but
     # validate the shape regardless so a typo can't silently do something odd

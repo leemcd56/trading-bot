@@ -879,6 +879,15 @@ def _make_trends_db(rows: list[tuple]) -> str:
     return db_file.name
 
 
+def _make_empty_db() -> str:
+    """Path to a fresh, empty DuckDB file - tables are created on demand by _ensure_* helpers."""
+    db_file = tempfile.NamedTemporaryFile(suffix=".duckdb", delete=False)
+    db_file.close()
+    os.unlink(db_file.name)
+    duckdb.connect(db_file.name).close()
+    return db_file.name
+
+
 def test_daily_returns_empty_for_unknown_symbol():
     db_path = _make_trends_db([])
     try:
@@ -1286,6 +1295,144 @@ def test_try_mean_reversion_holds_own_position_when_target_not_hit():
         analysis = _choppy_analysis(price=95.0, rsi=55.0, near_lower=False, near_upper=False)
         trading.execute_trade("TEST", analysis)
         mock_client.submit_order.assert_not_called()
+
+
+# ─── Circuit breaker ───
+
+def test_circuit_breaker_tripped_when_drawdown_meets_threshold():
+    with patch.object(trading, "CIRCUIT_BREAKER_ENABLED", True), \
+         patch.object(trading, "CIRCUIT_BREAKER_DRAWDOWN_PCT", 0.05):
+        # 10000 -> 9500 is exactly 5% down
+        assert trading._circuit_breaker_tripped(9500.0, 10000.0) is True
+
+
+def test_circuit_breaker_not_tripped_under_threshold():
+    with patch.object(trading, "CIRCUIT_BREAKER_ENABLED", True), \
+         patch.object(trading, "CIRCUIT_BREAKER_DRAWDOWN_PCT", 0.05):
+        assert trading._circuit_breaker_tripped(9600.0, 10000.0) is False
+
+
+def test_circuit_breaker_disabled_never_trips():
+    with patch.object(trading, "CIRCUIT_BREAKER_ENABLED", False), \
+         patch.object(trading, "CIRCUIT_BREAKER_DRAWDOWN_PCT", 0.05):
+        assert trading._circuit_breaker_tripped(1000.0, 10000.0) is False
+
+
+def test_circuit_breaker_fails_open_without_baseline():
+    """No open-equity snapshot yet (e.g. first minutes after startup) -> not tripped, not blocked."""
+    with patch.object(trading, "CIRCUIT_BREAKER_ENABLED", True), \
+         patch.object(trading, "CIRCUIT_BREAKER_DRAWDOWN_PCT", 0.05):
+        assert trading._circuit_breaker_tripped(100.0, None) is False
+        assert trading._circuit_breaker_tripped(100.0, 0) is False
+
+
+def test_todays_open_equity_returns_none_when_not_yet_captured():
+    db_path = _make_empty_db()
+    try:
+        with patch.object(trading, "DB_PATH", db_path):
+            assert trading._todays_open_equity() is None
+    finally:
+        os.unlink(db_path)
+
+
+def test_todays_open_equity_reads_todays_open_snapshot():
+    db_path = _make_empty_db()
+    try:
+        today_et = trading.datetime.now(trading._ET).strftime("%Y-%m-%d")
+        con = duckdb.connect(db_path)
+        con.execute("""
+            CREATE TABLE portfolio_snapshots (
+                timestamp_utc DOUBLE, date_et VARCHAR, label VARCHAR, equity DOUBLE
+            )
+        """)
+        con.execute(
+            "INSERT INTO portfolio_snapshots VALUES (?, ?, ?, ?), (?, ?, ?, ?)",
+            [1.0, today_et, "open", 10000.0, 2.0, "2000-01-01", "open", 1.0],
+        )
+        con.close()
+        with patch.object(trading, "DB_PATH", db_path):
+            assert trading._todays_open_equity() == 10000.0
+    finally:
+        os.unlink(db_path)
+
+
+def test_claim_circuit_breaker_alert_once_per_day():
+    db_path = _make_empty_db()
+    try:
+        with patch.object(trading, "DB_PATH", db_path):
+            assert trading._claim_circuit_breaker_alert_for_today() is True
+            assert trading._claim_circuit_breaker_alert_for_today() is False
+            assert trading._claim_circuit_breaker_alert_for_today() is False
+    finally:
+        os.unlink(db_path)
+
+
+def test_entry_caps_blocks_buy_when_circuit_breaker_tripped():
+    """A tripped circuit breaker refuses the BUY and alerts exactly once."""
+    db_path = _make_empty_db()
+    try:
+        with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
+             patch.object(trading, "DB_PATH", db_path), \
+             patch.object(trading, "CIRCUIT_BREAKER_ENABLED", True), \
+             patch.object(trading, "CIRCUIT_BREAKER_DRAWDOWN_PCT", 0.05), \
+             patch.object(trading, "send_alert") as mock_alert:
+            mock_client.get_open_position.side_effect = Exception("position does not exist")
+            mock_client.get_all_positions.return_value = []
+            # equity 9000 vs open 10000 -> 10% drawdown, well past the 5% threshold
+            mock_client.get_account.return_value = SimpleNamespace(equity="9000", buying_power="9000")
+            today_et = trading.datetime.now(trading._ET).strftime("%Y-%m-%d")
+            con = duckdb.connect(db_path)
+            con.execute("""
+                CREATE TABLE portfolio_snapshots (
+                    timestamp_utc DOUBLE, date_et VARCHAR, label VARCHAR, equity DOUBLE
+                )
+            """)
+            con.execute(
+                "INSERT INTO portfolio_snapshots VALUES (?, ?, ?, ?)", [1.0, today_et, "open", 10000.0]
+            )
+            con.close()
+
+            trading.execute_trade("TEST", _full_buy_analysis_at(100.0))
+            mock_client.submit_order.assert_not_called()
+            assert mock_alert.call_count == 1
+            assert "Circuit breaker" in mock_alert.call_args[0][0]
+
+            # A second blocked symbol the same day must not alert again.
+            trading.execute_trade("OTHER", _full_buy_analysis_at(100.0))
+            mock_client.submit_order.assert_not_called()
+            assert mock_alert.call_count == 1
+    finally:
+        os.unlink(db_path)
+
+
+def test_entry_caps_allows_buy_when_drawdown_under_threshold():
+    db_path = _make_empty_db()
+    try:
+        with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
+             patch.object(trading, "DB_PATH", db_path), \
+             patch.object(trading, "CIRCUIT_BREAKER_ENABLED", True), \
+             patch.object(trading, "CIRCUIT_BREAKER_DRAWDOWN_PCT", 0.05), \
+             patch.object(trading, "MAX_PORTFOLIO_RISK_PCT", 0.50):
+            mock_client.get_open_position.side_effect = Exception("position does not exist")
+            mock_client.get_all_positions.return_value = []
+            # equity 9800 vs open 10000 -> 2% drawdown, under the 5% threshold
+            mock_client.get_account.return_value = SimpleNamespace(equity="9800", buying_power="9800")
+            today_et = trading.datetime.now(trading._ET).strftime("%Y-%m-%d")
+            con = duckdb.connect(db_path)
+            con.execute("""
+                CREATE TABLE portfolio_snapshots (
+                    timestamp_utc DOUBLE, date_et VARCHAR, label VARCHAR, equity DOUBLE
+                )
+            """)
+            con.execute(
+                "INSERT INTO portfolio_snapshots VALUES (?, ?, ?, ?)", [1.0, today_et, "open", 10000.0]
+            )
+            con.close()
+
+            trading.execute_trade("TEST", _full_buy_analysis_at(100.0))
+            mock_client.submit_order.assert_called_once()
+    finally:
+        os.unlink(db_path)
 
 
 def test_ta_sell_signal_helper():

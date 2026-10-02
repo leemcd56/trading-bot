@@ -27,6 +27,8 @@ PARAMS = {
     "MAX_PORTFOLIO_RISK_PCT": 0.12,  # at most 12% of equity at risk across all open positions at once
     "MAX_POSITION_CORRELATION": 0.9,  # barely restricts - aggressive wants to act on every signal
     "MAX_SLIPPAGE_PCT": 0.01,  # cap qty orders 1% from the decision-time price (marketable limit)
+    "CIRCUIT_BREAKER_ENABLED": True,
+    "CIRCUIT_BREAKER_DRAWDOWN_PCT": 0.08,  # block new entries after an 8% intraday equity drop
 
     # Stop-loss / trailing stop
     "STOP_LOSS_PCT": 0.03,        # exit if position drops 3% from entry (cut fast)

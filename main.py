@@ -35,6 +35,8 @@ from config import (
     NOTIONAL_PER_TRADE,
     ADX_STRONG_TREND_THRESHOLD,
     MEAN_REVERSION_ENABLED,
+    CIRCUIT_BREAKER_ENABLED,
+    CIRCUIT_BREAKER_DRAWDOWN_PCT,
 )
 
 _ET = pytz.timezone("US/Eastern")
@@ -189,6 +191,8 @@ if __name__ == "__main__":
         f"stop={STOP_LOSS_PCT:.0%} trail_activate={TRAIL_ACTIVATION_PCT:.0%} trail={TRAIL_PCT:.0%} | "
         f"notional=${NOTIONAL_PER_TRADE} adx_threshold={ADX_STRONG_TREND_THRESHOLD} | "
         f"mean_reversion={'ON' if MEAN_REVERSION_ENABLED else 'off'} "
+        f"circuit_breaker={'ON' if CIRCUIT_BREAKER_ENABLED else 'off'} "
+        f"({CIRCUIT_BREAKER_DRAWDOWN_PCT:.0%} drawdown) "
         f"heartbeat={'configured' if HEARTBEAT_URL else 'off'}"
     )
     if not HEARTBEAT_URL:
@@ -197,7 +201,11 @@ if __name__ == "__main__":
             "If it crashes or hangs, nothing will tell you. Set HEARTBEAT_URL in .env to a "
             "ping URL from a service like healthchecks.io (see AGENTS.md)."
         )
-    # Run both jobs immediately so we see activity right away (e.g. in Railway logs).
+    # Run immediately so we see activity right away (e.g. in Railway logs).
+    # open_snapshot_job() runs before ta_job() so the circuit breaker has
+    # today's open-equity baseline from the very first cycle, not just after
+    # its own 15-minute schedule tick.
+    open_snapshot_job()
     fmp_job()
     ta_job()
 
