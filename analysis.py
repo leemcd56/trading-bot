@@ -347,6 +347,16 @@ def _analyze_df(symbol: str, df: pd.DataFrame, use_staleness_check: bool) -> dic
         "adx_rising": adx_rising,
         "volume_confirmed": volume_confirmed,
         "above_long_term_ma": above_long_term_ma,
+        # Raw indicator values (for external review / AI confirmation context —
+        # the boolean flags above are derived from these but a reviewer benefits
+        # from the actual numbers).
+        "adx": float(adx) if _ok(adx) else None,
+        "plus_di": float(plus_di) if _ok(plus_di) else None,
+        "minus_di": float(minus_di) if _ok(minus_di) else None,
+        "rsi_14": float(rsi) if _ok(rsi) else None,
+        "macd": float(macd) if _ok(macd) else None,
+        "macd_signal": float(macd_sig) if _ok(macd_sig) else None,
+        "sma_50": float(sma50) if _ok(sma50) else None,
     }
 
 
