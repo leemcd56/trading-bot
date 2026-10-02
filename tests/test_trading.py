@@ -87,8 +87,10 @@ def test_downtrend_stays_put_no_buy():
 def test_all_buy_conditions_submits_buy():
     """When all buy conditions are True, submit_order(BUY) should be called."""
     with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
-         patch.object(trading, "_get_buying_power", return_value=100_000.0):
+         patch.object(trading, "_get_buying_power", return_value=100_000.0), \
+         patch.object(trading, "_get_account_equity", return_value=100_000.0):
         mock_client.get_all_positions.return_value = []  # under max open positions
+        mock_client.get_open_position.side_effect = Exception("position does not exist")
         analysis = {
             "strong_trend": True,
             "uptrend": True,
@@ -117,8 +119,10 @@ def test_all_buy_conditions_submits_buy():
 def test_recent_bullish_signal_can_submit_buy():
     """A recent bullish confirmation should allow BUY even without same-bar crossover/flip."""
     with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
-         patch.object(trading, "_get_buying_power", return_value=100_000.0):
+         patch.object(trading, "_get_buying_power", return_value=100_000.0), \
+         patch.object(trading, "_get_account_equity", return_value=100_000.0):
         mock_client.get_all_positions.return_value = []
+        mock_client.get_open_position.side_effect = Exception("position does not exist")
         analysis = {
             "strong_trend": True,
             "uptrend": True,
@@ -1132,6 +1136,153 @@ def test_compute_mean_reversion_qty_falls_back_to_min_shares():
     with patch.object(trading, "MEAN_REVERSION_RISK_PCT_PER_TRADE", 0.005):
         assert trading._compute_mean_reversion_qty({"current_price": 0}, 10_000.0) == trading.MIN_SHARES
         assert trading._compute_mean_reversion_qty({"current_price": 50.0}, 0) == trading.MIN_SHARES
+
+
+def test_compute_buy_qty_fixed_qty_fallback_still_respects_exposure_cap():
+    """
+    Code-review finding: a mode with RISK_PCT_PER_TRADE=None (the documented
+    'fixed qty=1' option) must not get a free pass around the same-symbol
+    exposure cap just because it skips risk-based sizing entirely.
+    """
+    with patch.object(trading, "RISK_PCT_PER_TRADE", None), \
+         patch.object(trading, "MAX_POSITION_PCT_EQUITY", 0.10):
+        # No room left (already at the cap) -> 0, not the old unconditional 1.
+        qty = trading._compute_buy_qty({"current_price": 100.0}, 10_000.0, existing_position_value=1000.0)
+        assert qty == 0
+        # Still room -> the fixed qty=1 goes through.
+        qty = trading._compute_buy_qty({"current_price": 100.0}, 10_000.0, existing_position_value=0.0)
+        assert qty == 1
+
+
+def test_compute_mean_reversion_qty_fixed_qty_fallback_still_respects_exposure_cap():
+    with patch.object(trading, "MEAN_REVERSION_RISK_PCT_PER_TRADE", None), \
+         patch.object(trading, "MAX_POSITION_PCT_EQUITY", 0.10):
+        qty = trading._compute_mean_reversion_qty({"current_price": 100.0}, 10_000.0, existing_position_value=1000.0)
+        assert qty == 0
+
+
+# ─── Same-symbol exposure cap (MAX_POSITION_PCT_EQUITY is total, not per-order) ───
+
+def test_risk_based_qty_reduces_for_room_left():
+    """An existing position eats into the room available for a new buy, not just the cap itself."""
+    with patch.object(trading, "MAX_POSITION_PCT_EQUITY", 0.10), \
+         patch.object(trading, "MAX_SHARES", 1000), \
+         patch.object(trading, "MIN_SHARES", 1):
+        # cap = 10% of 10000 = 1000; already holding $700 worth -> only $300 of room -> 3 shares @ $100
+        qty = trading._risk_based_qty(
+            equity=10_000.0, price=100.0, risk_pct=0.5, stop_distance=1.0, existing_position_value=700.0
+        )
+        assert qty == 3
+
+
+def test_risk_based_qty_zero_when_already_at_cap():
+    """Already at/over the cap -> 0, not MIN_SHARES. Forcing a minimum buy here would defeat the cap entirely."""
+    with patch.object(trading, "MAX_POSITION_PCT_EQUITY", 0.10), \
+         patch.object(trading, "MAX_SHARES", 1000), \
+         patch.object(trading, "MIN_SHARES", 1):
+        qty = trading._risk_based_qty(
+            equity=10_000.0, price=100.0, risk_pct=0.5, stop_distance=1.0, existing_position_value=1000.0
+        )
+        assert qty == 0
+
+
+def test_risk_based_qty_zero_when_over_cap():
+    with patch.object(trading, "MAX_POSITION_PCT_EQUITY", 0.10), \
+         patch.object(trading, "MAX_SHARES", 1000), \
+         patch.object(trading, "MIN_SHARES", 1):
+        qty = trading._risk_based_qty(
+            equity=10_000.0, price=100.0, risk_pct=0.5, stop_distance=1.0, existing_position_value=1500.0
+        )
+        assert qty == 0
+
+
+def test_risk_based_qty_unaffected_when_no_existing_position():
+    """existing_position_value=0 (the default) must behave exactly like before this feature existed."""
+    with patch.object(trading, "MAX_POSITION_PCT_EQUITY", 0.10), \
+         patch.object(trading, "MAX_SHARES", 1000), \
+         patch.object(trading, "MIN_SHARES", 1):
+        with_default = trading._risk_based_qty(equity=10_000.0, price=100.0, risk_pct=0.5, stop_distance=1.0)
+        with_explicit_zero = trading._risk_based_qty(
+            equity=10_000.0, price=100.0, risk_pct=0.5, stop_distance=1.0, existing_position_value=0.0
+        )
+        assert with_default == with_explicit_zero == 10  # cap = 1000/100 = 10 shares
+
+
+def test_existing_position_value_reflects_held_shares():
+    with patch.object(trading, "trading_client") as mock_client:
+        mock_client.get_open_position.return_value = SimpleNamespace(qty="5")
+        assert trading._existing_position_value("AAPL", 100.0) == pytest.approx(500.0)
+
+
+def test_existing_position_value_zero_when_no_position():
+    with patch.object(trading, "trading_client") as mock_client:
+        mock_client.get_open_position.side_effect = Exception("position does not exist")
+        assert trading._existing_position_value("AAPL", 100.0) == 0.0
+
+
+def test_existing_position_value_zero_when_qty_not_positive():
+    with patch.object(trading, "trading_client") as mock_client:
+        mock_client.get_open_position.return_value = SimpleNamespace(qty="0")
+        assert trading._existing_position_value("AAPL", 100.0) == 0.0
+
+
+def test_entry_blocks_buy_already_at_position_cap():
+    """
+    This is the failure this feature fixes: a symbol already holding exactly
+    MAX_POSITION_PCT_EQUITY of equity must refuse to add more, rather than
+    the old behavior of forcing a minimum 1-share buy regardless of the cap
+    (see the MSFT incident in AGENTS.md - two same-day buys, each under the
+    per-order cap, stacked into a ~19.4% position that then took a single
+    stop-loss loss bigger than the account's entire realized P&L for the
+    next four months).
+    """
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "_get_buying_power", return_value=100_000.0), \
+         patch.object(trading, "_get_account_equity", return_value=100_000.0), \
+         patch.object(trading, "MAX_POSITION_PCT_EQUITY", 0.10):
+        # Already holding exactly $10,000 worth = 10% of equity -> zero room left.
+        mock_client.get_open_position.return_value = SimpleNamespace(qty="100", avg_entry_price="100.0")
+        mock_client.get_all_positions.return_value = [
+            SimpleNamespace(qty="100", avg_entry_price="100.0", symbol="TEST"),
+        ]
+        trading.execute_trade("TEST", _full_buy_analysis_at(100.0))
+        mock_client.submit_order.assert_not_called()
+
+
+def test_entry_sizes_down_buy_to_fit_remaining_room():
+    """
+    A symbol with SOME room left under the cap gets a smaller, rightsized
+    buy rather than either a full-size order (the old bug) or an outright
+    block (too blunt - there's still room, just not a full order's worth).
+    """
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "_get_buying_power", return_value=100_000.0), \
+         patch.object(trading, "_get_account_equity", return_value=100_000.0), \
+         patch.object(trading, "MAX_POSITION_PCT_EQUITY", 0.10):
+        # Holding $9,700 (9.7% of equity) -> only $300 of room left under the 10% cap.
+        mock_client.get_open_position.return_value = SimpleNamespace(qty="97", avg_entry_price="100.0")
+        mock_client.get_all_positions.return_value = [
+            SimpleNamespace(qty="97", avg_entry_price="100.0", symbol="TEST"),
+        ]
+        trading.execute_trade("TEST", _full_buy_analysis_at(100.0))
+        mock_client.submit_order.assert_called_once()
+        order = mock_client.submit_order.call_args[0][0]
+        assert float(order.qty) == 3  # $300 of room / $100 share price
+
+
+def test_entry_allows_buy_that_fits_remaining_room():
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "_get_buying_power", return_value=100_000.0), \
+         patch.object(trading, "_get_account_equity", return_value=100_000.0), \
+         patch.object(trading, "MAX_POSITION_PCT_EQUITY", 0.10), \
+         patch.object(trading, "MAX_PORTFOLIO_RISK_PCT", 0.50):
+        # Holding only $1,000 worth (1% of equity) - plenty of room left under the 10% cap.
+        mock_client.get_open_position.return_value = SimpleNamespace(qty="10", avg_entry_price="100.0")
+        mock_client.get_all_positions.return_value = [
+            SimpleNamespace(qty="10", avg_entry_price="100.0", symbol="TEST"),
+        ]
+        trading.execute_trade("TEST", _full_buy_analysis_at(100.0))
+        mock_client.submit_order.assert_called_once()
 
 
 def test_last_buy_source_reads_most_recent_buy():

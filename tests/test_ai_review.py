@@ -174,8 +174,10 @@ def test_execute_trade_skips_buy_when_ai_vetoes():
     with _patch_trade_limits(), \
          patch.object(trading, "trading_client") as mock_client, \
          patch.object(trading, "_get_buying_power", return_value=100_000.0), \
+         patch.object(trading, "_get_account_equity", return_value=100_000.0), \
          patch.object(trading, "confirm_trade", return_value={"decision": "VETO", "reasoning": "nope"}) as mock_confirm:
         mock_client.get_all_positions.return_value = []
+        mock_client.get_open_position.side_effect = Exception("position does not exist")
         trading.execute_trade("TEST", _buy_analysis())
         mock_confirm.assert_called_once_with("TEST", "BUY", _buy_analysis(), trading.TRADING_MODE)
         mock_client.submit_order.assert_not_called()
@@ -214,8 +216,10 @@ def test_execute_trade_places_buy_when_ai_confirms():
     with _patch_trade_limits(), \
          patch.object(trading, "trading_client") as mock_client, \
          patch.object(trading, "_get_buying_power", return_value=100_000.0), \
+         patch.object(trading, "_get_account_equity", return_value=100_000.0), \
          patch.object(trading, "confirm_trade", return_value={"decision": "CONFIRM", "reasoning": "ok"}):
         mock_client.get_all_positions.return_value = []
+        mock_client.get_open_position.side_effect = Exception("position does not exist")
         trading.execute_trade("TEST", _buy_analysis())
         mock_client.submit_order.assert_called_once()
 
@@ -254,11 +258,13 @@ def test_buy_alert_includes_ai_reasoning_when_gate_enabled():
     with _patch_trade_limits(), \
          patch.object(trading, "trading_client") as mock_client, \
          patch.object(trading, "_get_buying_power", return_value=100_000.0), \
+         patch.object(trading, "_get_account_equity", return_value=100_000.0), \
          patch.object(ai_review, "AI_CONFIRMATION_ENABLED", True), \
          patch.object(trading, "confirm_trade", return_value={"decision": "CONFIRM", "reasoning": "strong uptrend"}), \
          patch.object(trading, "_submit_order", return_value=(True, True)), \
          patch.object(trading, "send_alert") as mock_alert:
         mock_client.get_all_positions.return_value = []
+        mock_client.get_open_position.side_effect = Exception("position does not exist")
         trading.execute_trade("TEST", _buy_analysis())
         trade_alert_messages = [call.args[0] for call in mock_alert.call_args_list if call.args[1] == "trade"]
         assert any("strong uptrend" in msg for msg in trade_alert_messages)

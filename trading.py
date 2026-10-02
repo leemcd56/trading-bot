@@ -825,8 +825,9 @@ def _daily_returns(symbol: str, lookback_days: int) -> dict[int, float] | None:
     `trends` table. Returns None on a DB read failure; returns {} (not None)
     when the symbol simply has no/too-little history yet (e.g. never backfilled).
     """
-    con = duckdb.connect(DB_PATH)
+    con = None
     try:
+        con = duckdb.connect(DB_PATH)
         rows = con.execute(
             """
             SELECT timestamp, close FROM trends
@@ -840,7 +841,8 @@ def _daily_returns(symbol: str, lookback_days: int) -> dict[int, float] | None:
         logger.error(f"Correlation check: failed to read history for {symbol}: {e}")
         return None
     finally:
-        con.close()
+        if con is not None:
+            con.close()
 
     bars = sorted(
         ((int(ts), float(close)) for ts, close in rows if close is not None and float(close) > 0),
@@ -963,7 +965,27 @@ def _get_buying_power() -> float:
         return 0.0
 
 
-def _risk_based_qty(equity: float, price: float, risk_pct: float, stop_distance: float) -> int:
+def _existing_position_value(symbol: str, price: float) -> float:
+    """
+    Current market value of any existing position in `symbol` (qty * price),
+    or 0.0 if there isn't one / the lookup fails. "Fails" here overwhelmingly
+    means Alpaca's normal "position does not exist" response for a symbol
+    we don't hold - the common case - so this treats any lookup problem as
+    "assume flat" rather than blocking the trade; see _risk_based_qty for why
+    this value matters (capping TOTAL exposure to one symbol, not just the
+    size of a single order).
+    """
+    try:
+        position = trading_client.get_open_position(symbol)
+        qty = _to_float(getattr(position, "qty", 0)) or 0.0
+        return qty * price if qty > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _risk_based_qty(
+    equity: float, price: float, risk_pct: float, stop_distance: float, existing_position_value: float = 0.0
+) -> int:
     """
     Shared core of risk-based position sizing, used by both the trend
     strategy (_compute_buy_qty) and the mean-reversion counter-strategy
@@ -973,6 +995,17 @@ def _risk_based_qty(equity: float, price: float, risk_pct: float, stop_distance:
 
     qty = (risk_pct * equity) / stop_distance_per_share, rounded down,
     clamped to MIN/MAX_SHARES and MAX_POSITION_PCT_EQUITY of equity.
+
+    MAX_POSITION_PCT_EQUITY caps the symbol's TOTAL exposure (existing
+    position value + this new order), not just this order's own size - two
+    separate buys that each individually pass a per-order cap can otherwise
+    stack into an oversized concentrated position (this is exactly what
+    happened in practice: two ~9.7%-of-equity buys an hour apart, each under
+    a 10% per-order cap, combined into a ~19.4% position that then took a
+    single stop-loss loss larger than the bot's entire realized P&L for the
+    following four months). Returns 0 - not MIN_SHARES - when the symbol is
+    already at or over its cap, since "buy at least one share anyway" would
+    defeat the cap entirely.
     """
     if price <= 0 or equity <= 0 or stop_distance <= 0:
         return MIN_SHARES
@@ -980,47 +1013,75 @@ def _risk_based_qty(equity: float, price: float, risk_pct: float, stop_distance:
     # position_value * (stop_distance / price) = risk_amount  =>  position_value = risk_amount * price / stop_distance
     position_value = risk_amount * price / stop_distance
     qty = int(position_value / price)
-    max_value = MAX_POSITION_PCT_EQUITY * equity if MAX_POSITION_PCT_EQUITY else position_value
-    max_qty_by_value = int(max_value / price) if price > 0 else 0
-    qty = min(qty, max_qty_by_value, MAX_SHARES)
     qty = max(qty, MIN_SHARES)
-    return qty
+    qty = min(qty, MAX_SHARES)
+    return _clamp_to_position_cap(qty, price, equity, existing_position_value)
 
 
-def _compute_buy_qty(analysis: dict, equity: float) -> int:
+def _clamp_to_position_cap(qty: int, price: float, equity: float, existing_position_value: float) -> int:
+    """
+    Clamp `qty` so existing_position_value + qty*price never exceeds
+    MAX_POSITION_PCT_EQUITY of equity. Shared by every qty-producing path
+    (risk-based sizing and the fixed-qty-1 fallbacks below) so none of them
+    can accidentally bypass the same-symbol exposure cap. Returns 0 - not a
+    smaller positive floor - when there's no room left, since forcing a
+    minimum buy at the cap would defeat the cap entirely.
+    """
+    if not MAX_POSITION_PCT_EQUITY or price <= 0:
+        return qty
+    room_left = MAX_POSITION_PCT_EQUITY * equity - existing_position_value
+    if room_left <= 0:
+        return 0
+    return max(0, min(qty, int(room_left / price)))
+
+
+def _compute_buy_qty(analysis: dict, equity: float, existing_position_value: float = 0.0) -> int:
     """
     Compute number of shares to buy using risk-based position sizing.
     Risk per trade = RISK_PCT_PER_TRADE * equity.
     Stop distance per share = max(ATR_14, current_price * STOP_LOSS_PCT).
-    If RISK_PCT_PER_TRADE is None or equity/analysis invalid, returns 1.
+    If RISK_PCT_PER_TRADE is None or equity/analysis invalid, returns 1
+    (still subject to the exposure cap below - a fixed-qty-1 mode gets no
+    exemption from MAX_POSITION_PCT_EQUITY just because it skips risk sizing).
+    `existing_position_value` is any shares of this symbol already held
+    (see _risk_based_qty) so repeated buys can't stack past MAX_POSITION_PCT_EQUITY.
     """
-    if RISK_PCT_PER_TRADE is None or RISK_PCT_PER_TRADE <= 0:
-        return 1
     price = analysis.get("current_price") or 0
+    if RISK_PCT_PER_TRADE is None or RISK_PCT_PER_TRADE <= 0:
+        if price <= 0 or equity <= 0:
+            return 1
+        return _clamp_to_position_cap(1, price, equity, existing_position_value)
     if price <= 0 or equity <= 0:
         return MIN_SHARES
     atr = analysis.get("atr_14")
     stop_distance = price * STOP_LOSS_PCT
     if atr is not None and atr > 0:
         stop_distance = max(stop_distance, atr)
-    return _risk_based_qty(equity, price, RISK_PCT_PER_TRADE, stop_distance)
+    return _risk_based_qty(equity, price, RISK_PCT_PER_TRADE, stop_distance, existing_position_value)
 
 
-def _compute_mean_reversion_qty(analysis: dict, equity: float) -> int:
+def _compute_mean_reversion_qty(analysis: dict, equity: float, existing_position_value: float = 0.0) -> int:
     """
     Risk-based sizing for the mean-reversion counter-strategy, using its own
     (smaller) MEAN_REVERSION_RISK_PCT_PER_TRADE and its own (tighter, fixed)
     MEAN_REVERSION_STOP_LOSS_PCT - not ATR-widened like _compute_buy_qty,
     since mean-reversion's stop is a precise, short-term target by design,
-    not a trend-following ATR-scaled stop.
+    not a trend-following ATR-scaled stop. `existing_position_value` - see
+    _risk_based_qty - is always 0 in practice here, since _try_mean_reversion
+    only ever buys when flat in the symbol, but the parameter is accepted for
+    symmetry with _compute_buy_qty (and still enforced below, for the same
+    reason as _compute_buy_qty's fallback: no path should be exempt from the
+    exposure cap).
     """
-    if MEAN_REVERSION_RISK_PCT_PER_TRADE is None or MEAN_REVERSION_RISK_PCT_PER_TRADE <= 0:
-        return MIN_SHARES
     price = analysis.get("current_price") or 0
+    if MEAN_REVERSION_RISK_PCT_PER_TRADE is None or MEAN_REVERSION_RISK_PCT_PER_TRADE <= 0:
+        if price <= 0 or equity <= 0:
+            return MIN_SHARES
+        return _clamp_to_position_cap(MIN_SHARES, price, equity, existing_position_value)
     if price <= 0 or equity <= 0:
         return MIN_SHARES
     stop_distance = price * MEAN_REVERSION_STOP_LOSS_PCT
-    return _risk_based_qty(equity, price, MEAN_REVERSION_RISK_PCT_PER_TRADE, stop_distance)
+    return _risk_based_qty(equity, price, MEAN_REVERSION_RISK_PCT_PER_TRADE, stop_distance, existing_position_value)
 
 
 def _mean_reversion_regime(analysis: dict) -> bool:
@@ -1692,7 +1753,12 @@ def _try_mean_reversion(symbol: str, analysis: dict):
     if equity is None:
         logger.warning(f"{symbol}: Skipping mean-reversion BUY - could not fetch account equity")
         return None
-    qty = _compute_mean_reversion_qty(analysis, equity) if equity > 0 else MIN_SHARES
+    # existing_position_value is always 0 here: this branch only runs when
+    # held_qty == 0 (checked above), so there's nothing to look up.
+    qty = _compute_mean_reversion_qty(analysis, equity, 0.0) if equity > 0 else MIN_SHARES
+    if qty <= 0:
+        logger.warning(f"{symbol}: Skipping mean-reversion BUY - position sizing returned 0")
+        return None
     price = analysis.get("current_price") or 0
     order_value = qty * price
     buying_power = _get_buying_power()
@@ -1779,6 +1845,22 @@ def execute_trade(symbol: str, analysis: dict | None):
             # Fractional mode: buy a fixed dollar amount, or 1 whole share if price <= notional
             buying_power = _get_buying_power()
             price = analysis.get("current_price") or 0
+
+            # Same total-exposure cap as the risk-based qty path (_risk_based_qty):
+            # don't add to a symbol already at or over MAX_POSITION_PCT_EQUITY.
+            # Best-effort - an equity-fetch failure here just skips this extra
+            # check rather than blocking an otherwise-small notional buy.
+            if MAX_POSITION_PCT_EQUITY and price > 0:
+                equity_for_cap = _get_account_equity()
+                if equity_for_cap and equity_for_cap > 0:
+                    existing_value = _existing_position_value(symbol, price)
+                    if existing_value >= MAX_POSITION_PCT_EQUITY * equity_for_cap:
+                        logger.warning(
+                            f"{symbol}: Skipping BUY - already at or over MAX_POSITION_PCT_EQUITY "
+                            f"(existing position worth ${existing_value:,.2f})"
+                        )
+                        return
+
             if price > 0 and price <= NOTIONAL_PER_TRADE and buying_power >= price:
                 # Rules engine has already formed its own BUY assumption and this
                 # specific order is affordable - only now ask the AI gate to
@@ -1841,8 +1923,15 @@ def execute_trade(symbol: str, analysis: dict | None):
             if equity is None:
                 logger.warning(f"{symbol}: Skipping BUY - could not fetch account equity")
                 return
-            qty = _compute_buy_qty(analysis, equity) if equity > 0 else MIN_SHARES
             price = analysis.get("current_price") or 0
+            existing_value = _existing_position_value(symbol, price) if price > 0 else 0.0
+            qty = _compute_buy_qty(analysis, equity, existing_value) if equity > 0 else MIN_SHARES
+            if qty <= 0:
+                logger.warning(
+                    f"{symbol}: Skipping BUY - already at or over MAX_POSITION_PCT_EQUITY "
+                    f"(existing position worth ${existing_value:,.2f})"
+                )
+                return
             order_value = qty * price
             buying_power = _get_buying_power()
             if order_value > 0 and buying_power < order_value:
