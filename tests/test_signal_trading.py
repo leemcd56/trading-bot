@@ -106,6 +106,27 @@ def test_signal_buy_max_positions_blocks():
         mock_client.submit_order.assert_not_called()
 
 
+def test_signal_buy_refuses_when_weekly_count_unavailable():
+    """A failed trade-log read must fail closed for signal buys too."""
+    with _patch_db_helpers(), \
+         patch.object(trading, "_count_daily", return_value=0), \
+         patch.object(trading, "_count_weekly", return_value=None), \
+         patch.object(trading, "trading_client") as mock_client:
+        trading.execute_signal_buy("AAPL")
+        mock_client.submit_order.assert_not_called()
+
+
+def test_signal_buy_refuses_when_open_positions_unavailable():
+    """A failed positions read must fail closed for signal buys."""
+    with _patch_db_helpers(), \
+         patch.object(trading, "_count_daily", return_value=0), \
+         patch.object(trading, "_count_weekly", return_value=0), \
+         patch.object(trading, "_open_positions_count", return_value=None), \
+         patch.object(trading, "trading_client") as mock_client:
+        trading.execute_signal_buy("AAPL")
+        mock_client.submit_order.assert_not_called()
+
+
 def test_signal_buy_already_holding_skips():
     """Already holding a non-zero position → no order submitted."""
     with _patch_db_helpers(), \
@@ -117,6 +138,18 @@ def test_signal_buy_already_holding_skips():
          patch.object(trading, "MAX_OPEN_POSITIONS", 99), \
          patch.object(trading, "trading_client") as mock_client:
         mock_client.get_open_position.return_value = MagicMock(qty=3)
+        trading.execute_signal_buy("AAPL")
+        mock_client.submit_order.assert_not_called()
+
+
+def test_signal_buy_position_error_refuses_order():
+    """Unexpected position-read failures must not fall through into a BUY."""
+    with _patch_db_helpers(), _caps_ok(), \
+         patch.object(trading, "NOTIONAL_PER_TRADE", 75), \
+         patch.object(trading, "_get_buying_power", return_value=500.0), \
+         patch("trading.get_intraday_price", return_value=300.0), \
+         patch.object(trading, "trading_client") as mock_client:
+        mock_client.get_open_position.side_effect = Exception("broker down")
         trading.execute_signal_buy("AAPL")
         mock_client.submit_order.assert_not_called()
 
@@ -347,5 +380,27 @@ def test_signal_sell_order_failure_does_not_raise():
             mock_client.submit_order.side_effect = Exception("broker error")
             # Should not raise
             trading.execute_signal_sell("AAPL")
+    finally:
+        os.unlink(path)
+
+
+def test_dormant_mode_blocks_signal_buy_and_sell():
+    """Dormant mode must submit no signal-path orders at all."""
+    path = _make_trade_log_db([(time.time() - 90000, "AAPL", "BUY", 1)])
+    try:
+        with _patch_db_helpers(), _caps_ok(), \
+             patch.object(trading, "TRADING_MODE", "dormant"), \
+             patch.object(trading, "NOTIONAL_PER_TRADE", 75), \
+             patch.object(trading, "_get_buying_power", return_value=500.0), \
+             patch("trading.get_intraday_price", return_value=150.0), \
+             patch.object(trading, "DB_PATH", path), \
+             patch.object(trading, "trading_client") as mock_client:
+            mock_client.get_open_position.side_effect = [
+                Exception("position does not exist"),
+                MagicMock(qty=1),
+            ]
+            trading.execute_signal_buy("MSFT")
+            trading.execute_signal_sell("AAPL")
+            mock_client.submit_order.assert_not_called()
     finally:
         os.unlink(path)

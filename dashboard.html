@@ -84,28 +84,47 @@
       letter-spacing: -0.02em;
     }
 
-    .live-pill {
+    .status-pill {
       display: flex;
       align-items: center;
       gap: 5px;
       padding: 2px 8px 2px 6px;
       border-radius: 20px;
-      background: var(--green-dim);
-      border: 1px solid var(--green-border);
       font-size: 10px;
       font-weight: 600;
-      color: var(--green);
       letter-spacing: 0.08em;
       text-transform: uppercase;
     }
 
-    .live-dot {
+    .status-dot {
       width: 5px;
       height: 5px;
       border-radius: 50%;
+    }
+
+    .status-paper {
+      background: var(--green-dim);
+      border: 1px solid var(--green-border);
+      color: var(--green);
+    }
+    .status-paper .status-dot {
       background: var(--green);
       animation: blink 2s ease-in-out infinite;
     }
+
+    .status-dormant {
+      background: rgba(125, 133, 144, 0.08);
+      border: 1px solid rgba(125, 133, 144, 0.20);
+      color: var(--muted);
+    }
+    .status-dormant .status-dot { background: var(--muted); }
+
+    .status-degraded {
+      background: var(--red-dim);
+      border: 1px solid var(--red-border);
+      color: var(--red);
+    }
+    .status-degraded .status-dot { background: var(--red); }
 
     @keyframes blink {
       0%, 100% { opacity: 1; }
@@ -536,7 +555,9 @@
 <header>
   <div class="h-left">
     <span class="logo">Trading Bot</span>
-    <div class="live-pill"><div class="live-dot"></div>Live</div>
+    <div id="statusPill" class="status-pill __STATUS_CLASS__" title="">
+      <div class="status-dot"></div><span id="statusText">__STATUS_TEXT__</span>
+    </div>
     <div id="modeBadge" class="mode-badge" style="display:none">
       <span class="mode-icon" id="modeIcon"></span>
       <span id="modeText"></span>
@@ -547,7 +568,7 @@
       </span>
     </div>
   </div>
-  <span id="lastUpdated">—</span>
+  <span id="lastUpdated">__LAST_UPDATED__</span>
 </header>
 
 <main>
@@ -612,7 +633,7 @@
       <div id="posWrap"><div class="empty">Loading…</div></div>
     </div>
     <div class="card">
-      <div class="card-label">Recent Transactions</div>
+      <div class="card-label">Recent Filled Trades</div>
       <div id="txWrap"><div class="empty">Loading…</div></div>
     </div>
   </div>
@@ -621,6 +642,7 @@
 
 <script>
   // ── helpers ─────────────────────────────────────────────────────────────
+  const BOOTSTRAP = __BOOTSTRAP_STATE__;
   const $ = id => document.getElementById(id);
   const usd = n => n != null
     ? '$' + Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})
@@ -654,6 +676,14 @@
     }
   }
 
+  function renderSummaryUnavailable(message = 'Unavailable') {
+    $('sEquity').textContent = '—';
+    $('sCash').textContent = '—';
+    $('sBP').textContent = 'Buying power: —';
+    $('sDelta').textContent = message;
+    $('sDelta').className = 'stat-sub neu';
+  }
+
   // ── positions ────────────────────────────────────────────────────────────
   function renderPositions(positions) {
     const totalPL = positions.reduce((s, p) => s + (p.unrealized_pl || 0), 0);
@@ -684,6 +714,13 @@
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
+  }
+
+  function renderPositionsUnavailable(message = 'Positions unavailable') {
+    $('sPositions').textContent = '—';
+    $('sTotalPL').textContent = 'Unrealized P&L: —';
+    $('sTotalPL').className = 'stat-sub neu';
+    $('posWrap').innerHTML = `<div class="empty">${message}</div>`;
   }
 
   // ── transactions ─────────────────────────────────────────────────────────
@@ -817,13 +854,22 @@
   function renderTradeCounts(d) {
     $('lDaily').textContent  = `${d.daily} / ${d.daily_max}`;
     $('lWeekly').textContent = `${d.weekly} / ${d.weekly_max}`;
-    function setBar(id, pct) {
+    function setBar(id, value, max) {
       const el = $(id);
+      const pct = max > 0 ? (value / max) * 100 : 0;
       el.style.width = Math.min(100, pct) + '%';
       el.className   = 'fill ' + (pct >= 100 ? 'fill-danger' : pct >= 66 ? 'fill-warn' : 'fill-ok');
     }
-    setBar('lDailyBar',  (d.daily  / d.daily_max)  * 100);
-    setBar('lWeeklyBar', (d.weekly / d.weekly_max) * 100);
+    setBar('lDailyBar', d.daily, d.daily_max);
+    setBar('lWeeklyBar', d.weekly, d.weekly_max);
+  }
+
+  function setHeaderState({label, cssClass, detail, updatedText}) {
+    const pill = $('statusPill');
+    pill.className = `status-pill ${cssClass}`;
+    pill.title = detail || '';
+    $('statusText').textContent = label;
+    $('lastUpdated').textContent = updatedText;
   }
 
   // ── load all ─────────────────────────────────────────────────────────────
@@ -837,12 +883,53 @@
       fetch('/api/trade-counts').then(r => r.json()),
     ]);
     if (sum.status  === 'fulfilled' && !sum.value?.error)    renderSummary(sum.value);
+    else renderSummaryUnavailable('Account unavailable');
     if (pos.status  === 'fulfilled' && Array.isArray(pos.value)) renderPositions(pos.value);
+    else renderPositionsUnavailable('Positions unavailable');
     if (txn.status  === 'fulfilled' && Array.isArray(txn.value)) renderTransactions(txn.value);
     if (hist.status === 'fulfilled' && Array.isArray(hist.value)) renderChart(hist.value);
     if (cnts.status === 'fulfilled' && !cnts.value?.error)   renderTradeCounts(cnts.value);
-    $('lastUpdated').textContent = 'Updated ' +
-      new Date().toLocaleTimeString('en-US', {hour:'numeric', minute:'2-digit', second:'2-digit'});
+
+    const summaryOk = sum.status === 'fulfilled' && !sum.value?.error;
+    const positionsOk = pos.status === 'fulfilled' && Array.isArray(pos.value);
+    const healthy = summaryOk && positionsOk;
+    const nowText = new Date().toLocaleTimeString('en-US', {hour:'numeric', minute:'2-digit', second:'2-digit'});
+
+    if (BOOTSTRAP.statusLabel === 'Dormant') {
+      setHeaderState({
+        label: 'Dormant',
+        cssClass: healthy ? 'status-dormant' : 'status-degraded',
+        detail: healthy ? 'Orders are disabled in dormant mode.' : 'Dashboard refresh failed while dormant mode is active.',
+        updatedText: healthy ? `Updated ${nowText}` : `Update failed ${nowText}`,
+      });
+      return;
+    }
+
+    if (BOOTSTRAP.statusLabel === 'Misconfigured') {
+      setHeaderState({
+        label: 'Misconfigured',
+        cssClass: 'status-degraded',
+        detail: BOOTSTRAP.statusDetail,
+        updatedText: BOOTSTRAP.statusDetail,
+      });
+      return;
+    }
+
+    setHeaderState(
+      healthy
+        ? {
+            label: 'Paper',
+            cssClass: 'status-paper',
+            detail: 'Paper trading is enabled.',
+            updatedText: `Updated ${nowText}`,
+          }
+        : {
+            label: 'Degraded',
+            cssClass: 'status-degraded',
+            detail: 'Account or positions data could not be refreshed.',
+            updatedText: `Update failed ${nowText}`,
+          }
+    );
   }
 
   // ── mode badge ───────────────────────────────────────────────────────────
@@ -866,6 +953,12 @@
 
   fetch('/api/mode').then(r => r.json()).then(renderMode).catch(() => {});
 
+  setHeaderState({
+    label: BOOTSTRAP.statusLabel,
+    cssClass: BOOTSTRAP.statusClass,
+    detail: BOOTSTRAP.statusDetail,
+    updatedText: BOOTSTRAP.lastUpdated,
+  });
   loadAll();
   setInterval(loadAll, 60_000);
 </script>

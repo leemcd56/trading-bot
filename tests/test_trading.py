@@ -2,6 +2,8 @@
 Tests for execute_trade: mock Alpaca client and assert buy/sell/no-op decisions.
 """
 import os
+import tempfile
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 # Set before importing trading so TradingClient(...) does not raise (we mock it in tests)
@@ -343,8 +345,8 @@ def test_notional_mode_skips_when_buying_power_below_minimum():
 # ─── PDT awareness ───
 
 
-def test_pdt_blocks_stop_loss_sell():
-    """When PDT limit reached, stop-loss SELL is skipped (no order submitted)."""
+def test_pdt_does_not_block_stop_loss_sell():
+    """Risk exits must still submit even when the PDT counter is full."""
     with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
          patch.object(trading, "_should_block_sell_pdt", return_value=True):
         mock_client.get_open_position.return_value = MagicMock(
@@ -357,7 +359,8 @@ def test_pdt_blocks_stop_loss_sell():
         }
         trading.execute_trade("TEST", analysis)
         mock_client.get_open_position.assert_called_with("TEST")
-        mock_client.submit_order.assert_not_called()
+        mock_client.submit_order.assert_called_once()
+        assert mock_client.submit_order.call_args[0][0].side == OrderSide.SELL
 
 
 def test_pdt_blocks_signal_sell():
@@ -379,8 +382,8 @@ def test_pdt_blocks_signal_sell():
         mock_client.submit_order.assert_not_called()
 
 
-def test_pdt_blocks_trailing_stop_sell():
-    """When PDT limit reached, trailing-stop SELL is skipped."""
+def test_pdt_does_not_block_trailing_stop_sell():
+    """Trailing stops are risk exits and must still submit under PDT pressure."""
     with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
          patch.object(trading, "_should_block_sell_pdt", return_value=True), \
          patch.object(trading, "_get_trail_running_high", return_value=110.0):
@@ -405,7 +408,8 @@ def test_pdt_blocks_trailing_stop_sell():
             "bearish_crossover": False,
         }
         trading.execute_trade("TEST", analysis)
-        mock_client.submit_order.assert_not_called()
+        mock_client.submit_order.assert_called_once()
+        assert mock_client.submit_order.call_args[0][0].side == OrderSide.SELL
 
 
 # ─── Trailing stop ───
@@ -598,6 +602,68 @@ def test_stop_loss_fires_without_strong_trend():
         trading.execute_trade("TEST", analysis)
         mock_client.submit_order.assert_called_once()
         assert mock_client.submit_order.call_args[0][0].side == OrderSide.SELL
+
+
+def test_buy_refuses_when_daily_count_unavailable():
+    """A failed trade-log read must fail closed and refuse a new BUY."""
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "_count_daily", return_value=None):
+        mock_client.get_all_positions.return_value = []
+        trading.execute_trade("TEST", _buy_conditions_for_notional())
+        mock_client.submit_order.assert_not_called()
+
+
+def test_live_host_mismatch_disables_order_submission():
+    """Paper mode must not submit orders against a live Alpaca host override."""
+    with patch.object(trading, "_base_url", "https://api.alpaca.markets"), \
+         patch.object(trading, "TRADING_MODE", "moderate"):
+        status = trading.get_trading_runtime_status()
+        assert status["orders_allowed"] is False
+        assert status["state"] == "misconfigured"
+
+
+def test_dormant_mode_blocks_stop_loss_submit():
+    """Dormant mode suppresses stop-loss orders in addition to buys."""
+    with _patch_trade_limits(), patch.object(trading, "trading_client") as mock_client, \
+         patch.object(trading, "TRADING_MODE", "dormant"):
+        mock_client.get_open_position.return_value = MagicMock(
+            qty=1,
+            avg_entry_price="100.0",
+        )
+        trading.execute_trade("TEST", {"strong_trend": True, "current_price": 94.0})
+        mock_client.submit_order.assert_not_called()
+
+
+def test_unfilled_stop_loss_sell_is_not_logged():
+    """A submitted-but-unfilled exit must not consume a PDT/history slot locally."""
+    db_file = tempfile.NamedTemporaryFile(suffix=".duckdb", delete=False)
+    db_file.close()
+    os.unlink(db_file.name)
+
+    unfilled_order = SimpleNamespace(
+        id="order-1",
+        status="new",
+        filled_qty="0",
+        filled_avg_price=None,
+        qty="1",
+    )
+    try:
+        with patch.object(trading, "DB_PATH", db_file.name), \
+             patch.object(trading, "trading_client") as mock_client, \
+             patch.object(trading, "_record_trade") as record_trade, \
+             patch.object(trading, "_record_trade_history") as record_history:
+            mock_client.get_open_position.return_value = MagicMock(
+                qty=1,
+                avg_entry_price="100.0",
+            )
+            mock_client.submit_order.return_value = unfilled_order
+            mock_client.get_order_by_id.return_value = unfilled_order
+            trading.execute_trade("TEST", {"strong_trend": True, "current_price": 94.0})
+            record_trade.assert_not_called()
+            record_history.assert_not_called()
+    finally:
+        if os.path.exists(db_file.name):
+            os.unlink(db_file.name)
 
 
 def test_ta_sell_signal_helper():
